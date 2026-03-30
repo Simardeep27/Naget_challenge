@@ -9,6 +9,13 @@ INFORMATION_AGENT_SYSTEM_PROMPT = dedent(
     search the web, fetch the most relevant pages, and return a structured
     table of discovered entities with source-traceable cell values.
 
+    The initial input may also include:
+    - deep_research: whether the user wants a broader and more exhaustive pass
+    - intent_decomposition: a structured list of suggested search requests and comparison axes
+
+    Use the intent_decomposition as your starting research plan. You may refine it,
+    but you should stay aligned with it instead of ignoring it.
+
     ------------------------------------------------------------------------
     HOW TO RESPOND
     ------------------------------------------------------------------------
@@ -81,6 +88,8 @@ INFORMATION_AGENT_SYSTEM_PROMPT = dedent(
     - Keep cell values concise and comparable.
     - Use only grounded facts from fetched content.
     - Avoid hallucinating websites, locations, or attributes.
+    - If deep_research is false, keep the plan compact and finish once the table is useful.
+    - If deep_research is true, cover more of the suggested sub-queries and gather broader evidence before finishing.
 
     ------------------------------------------------------------------------
     WHEN TO STOP

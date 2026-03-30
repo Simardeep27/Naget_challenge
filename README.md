@@ -80,6 +80,15 @@ Or use the small wrapper:
 uv run python main.py "top pizza places in Brooklyn"
 ```
 
+If you do not pass a research-depth flag, the CLI will ask whether you want deep research.
+
+You can also set it explicitly:
+
+```bash
+uv run python info_agent.py "open source database tools" --deep-research
+uv run python info_agent.py "open source database tools" --no-deep-research
+```
+
 ## Output
 
 The run returns an `InformationAgentOutput` JSON object with:
@@ -89,6 +98,8 @@ The run returns an `InformationAgentOutput` JSON object with:
 - `markdown_file_path`
 - `result`
 - `meta`
+
+The `meta` object includes the selected research depth and the intent decomposition used to guide the search plan.
 
 Inside `result`:
 

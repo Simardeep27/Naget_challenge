@@ -18,6 +18,7 @@ from schema import (
     EntityRow,
     InformationAgentInput,
     InformationAgentOutput,
+    IntentDecomposition,
     SourceCitation,
     SourceRecord,
     StructuredEntityTable,
@@ -26,6 +27,11 @@ from schema import (
     ToolResult,
 )
 from tools.fetch_url import FetchURLTool, FetchURLToolInputSchema
+from tools.intent_classificaiton import (
+    IntentClassificationInput,
+    IntentClassificationTool,
+    IntentClassificationToolConfig,
+)
 from tools.web_search_tool import SearchTool, SearchToolConfig, SearchToolInput
 from tools.write_to_file import WriteToFileTool, WriteToFileToolInputSchema
 
@@ -38,8 +44,6 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-MAX_FETCH_CALLS = 8
-MAX_LOOP_ITERATIONS = 18
 MAX_CONTENT_CHARS = 12000
 OUTPUT_DIR = Path("output/information_agent")
 JSON_OUTPUT_PATH = OUTPUT_DIR / "latest_entities.json"
@@ -81,6 +85,18 @@ def _get_vertex_project() -> str:
 
 def _get_vertex_location() -> str:
     return os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global"
+
+
+def _get_search_result_limit(deep_research: bool) -> int:
+    return 12 if deep_research else 8
+
+
+def _get_fetch_limit(deep_research: bool) -> int:
+    return 12 if deep_research else 6
+
+
+def _get_loop_limit(deep_research: bool) -> int:
+    return 24 if deep_research else 16
 
 
 def _normalize_key(value: str) -> str:
@@ -303,7 +319,16 @@ class VertexInformationAgent:
         parts = [
             "Original topic query:",
             self.initial_input.information_request,
+            f"Deep research requested: {self.initial_input.deep_research}",
         ]
+
+        if self.initial_input.intent_decomposition is not None:
+            parts.extend(
+                [
+                    "Intent decomposition:",
+                    self.initial_input.intent_decomposition.model_dump_json(indent=2),
+                ]
+            )
 
         if self.history.messages:
             parts.append(
@@ -351,7 +376,7 @@ class VertexInformationAgent:
         raise ValueError("Vertex AI returned no parseable AgentAction.")
 
 
-def create_information_agent():
+def create_information_agent(deep_research: bool = False):
     """Create the agent and tools for the agentic research loop."""
     if _use_vertex_ai():
         project = _get_vertex_project()
@@ -404,7 +429,10 @@ def create_information_agent():
         agent.register_hook("completion:response", _on_completion_response)
 
     tools = {
-        "search_tool": SearchTool(SearchToolConfig()),
+        "intent_tool": IntentClassificationTool(IntentClassificationToolConfig()),
+        "search_tool": SearchTool(
+            SearchToolConfig(max_results=_get_search_result_limit(deep_research))
+        ),
         "fetch_url_tool": FetchURLTool(BaseToolConfig()),
         "write_file_tool": WriteToFileTool(BaseToolConfig()),
     }
@@ -412,34 +440,55 @@ def create_information_agent():
     return agent, tools
 
 
-def run_information_agent(information_request: str) -> str:
+def run_information_agent(
+    information_request: str, deep_research: bool = False
+) -> str:
     """
     Run the agentic entity-discovery loop and return a JSON string.
     """
     start_time = time.perf_counter()
-    agent, tools = create_information_agent()
+    agent, tools = create_information_agent(deep_research=deep_research)
 
+    intent_tool = tools["intent_tool"]
     search_tool = tools["search_tool"]
     fetch_tool = tools["fetch_url_tool"]
     write_tool = tools["write_file_tool"]
 
+    fetch_limit = _get_fetch_limit(deep_research)
+    loop_limit = _get_loop_limit(deep_research)
     fetch_count = 0
     queries_run: list[dict[str, object]] = []
     total_results = 0
     json_file_path = ""
     markdown_file_path = ""
     final_table: StructuredEntityTable | None = None
+    intent_decomposition: IntentDecomposition = intent_tool.run(
+        IntentClassificationInput(
+            user_request=information_request,
+            deep_research=deep_research,
+        )
+    )
 
     source_registry: dict[str, dict[str, str | None]] = {}
     url_to_source_id: dict[str, str] = {}
 
     logger.info("starting entity discovery for topic query")
 
-    action: AgentAction = agent.run(
-        InformationAgentInput(information_request=information_request)
+    logger.info(
+        "intent decomposition ready: depth=%s, search_requests=%d",
+        intent_decomposition.research_depth,
+        len(intent_decomposition.search_requests),
     )
 
-    for iteration in range(1, MAX_LOOP_ITERATIONS + 1):
+    action: AgentAction = agent.run(
+        InformationAgentInput(
+            information_request=information_request,
+            deep_research=deep_research,
+            intent_decomposition=intent_decomposition,
+        )
+    )
+
+    for iteration in range(1, loop_limit + 1):
         logger.info(
             "[iter %d] agent -> %s | %s",
             iteration,
@@ -490,11 +539,11 @@ def run_information_agent(information_request: str) -> str:
                 tool_result_str = json.dumps(enriched_results, ensure_ascii=False)
 
         elif action.action_type == "fetch_url":
-            if fetch_count >= MAX_FETCH_CALLS:
+            if fetch_count >= fetch_limit:
                 tool_result_str = json.dumps(
                     {
                         "error": (
-                            f"fetch_url limit reached ({MAX_FETCH_CALLS} calls). "
+                            f"fetch_url limit reached ({fetch_limit} calls). "
                             "Use the fetched evidence you already have and finish."
                         )
                     },
@@ -513,7 +562,7 @@ def run_information_agent(information_request: str) -> str:
                         "  fetch_url: fetching %d URL(s) [call %d/%d]",
                         len(deduped_urls),
                         fetch_count,
-                        MAX_FETCH_CALLS,
+                        fetch_limit,
                     )
                     output = fetch_tool.run(FetchURLToolInputSchema(value=deduped_urls))
 
@@ -584,7 +633,7 @@ def run_information_agent(information_request: str) -> str:
     else:
         logger.warning(
             "agent loop exhausted (%d iterations) without finishing",
-            MAX_LOOP_ITERATIONS,
+            loop_limit,
         )
 
     execution_time_ms = int((time.perf_counter() - start_time) * 1000)
@@ -605,9 +654,12 @@ def run_information_agent(information_request: str) -> str:
         markdown_file_path=markdown_file_path,
         result=final_table,
         meta={
+            "deep_research": deep_research,
+            "intent_decomposition": intent_decomposition.model_dump(),
             "queries_run": queries_run,
             "total_results": total_results,
             "fetch_calls": fetch_count,
+            "fetch_limit": fetch_limit,
             "execution_time_ms": execution_time_ms,
             "model": _get_model_name(),
         },
@@ -615,12 +667,45 @@ def run_information_agent(information_request: str) -> str:
     return result.model_dump_json(indent=2)
 
 
+def resolve_deep_research_choice(explicit_choice: bool | None = None) -> bool:
+    if explicit_choice is not None:
+        return explicit_choice
+
+    answer = input("Run in deep-research mode? [y/N]: ").strip().lower()
+    return answer in {"y", "yes"}
+
+
 if __name__ == "__main__":
     import argparse
+    import time
 
     parser = argparse.ArgumentParser(
         description="Discover entities for a topic query using the info agent."
     )
     parser.add_argument("query", help="Topic query to search and structure")
+    group = parser.add_mutually_exclusive_group()
+
+    
+    group.add_argument(
+        "--deep-research",
+        dest="deep_research",
+        action="store_true",
+        default=None,
+        help="Run a broader and more exhaustive research pass",
+    )
+    group.add_argument(
+        "--no-deep-research",
+        dest="deep_research",
+        action="store_false",
+        help="Run the standard research pass",
+    )
     args = parser.parse_args()
-    print(run_information_agent(args.query))
+    time_st = time.time()
+    print(
+        run_information_agent(
+            args.query,
+            deep_research=resolve_deep_research_choice(args.deep_research),
+        )
+    )
+    time_end = time.time()
+    print("Processing time:", time_end - time_st)

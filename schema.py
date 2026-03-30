@@ -71,11 +71,46 @@ class StructuredEntityTable(BaseIOSchema):
     )
 
 
+class SearchIntent(BaseIOSchema):
+    """One search-ready sub-intent derived from the user's request."""
+
+    label: str = Field(..., description="Short label for this sub-intent")
+    query: str = Field(..., description="Search-engine-ready query")
+    purpose: str = Field(..., description="Why this search query is useful")
+
+
+class IntentDecomposition(BaseIOSchema):
+    """Structured decomposition of the user's request before research begins."""
+
+    user_query: str = Field(..., description="Original user query")
+    research_depth: Literal["standard", "deep"] = Field(
+        ..., description="Requested research depth"
+    )
+    entity_type: str = Field(..., description="Likely entity type to discover")
+    intent_summary: str = Field(..., description="Concise summary of user intent")
+    comparison_axes: list[str] = Field(
+        default_factory=list,
+        description="Suggested attributes to compare across entities",
+    )
+    search_requests: list[SearchIntent] = Field(
+        default_factory=list,
+        description="Non-overlapping search-ready sub-queries",
+    )
+
+
 class InformationAgentInput(BaseIOSchema):
     """Input payload for the information agent."""
 
     information_request: str = Field(
         ..., description="The topic query to research and structure"
+    )
+    deep_research: bool = Field(
+        default=False,
+        description="Whether to do a deeper, broader research pass",
+    )
+    intent_decomposition: IntentDecomposition | None = Field(
+        default=None,
+        description="Precomputed intent decomposition to guide search planning",
     )
 
 

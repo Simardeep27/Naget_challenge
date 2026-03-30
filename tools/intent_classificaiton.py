@@ -1,56 +1,224 @@
-from atomic_agents import BaseTool, BaseToolConfig, AtomicAgent, AgentConfig
-from schemas import (
-    IntentOutSchema,
-    UserRequest,
-)
-from pydantic import Field
-from litellm import acompletion
-from dotenv import load_dotenv
-import os
 import json
+import os
+
+from atomic_agents import BaseIOSchema, BaseTool, BaseToolConfig
+from dotenv import load_dotenv
+from openai import OpenAI
+from pydantic import Field
+
+from schema import IntentDecomposition, SearchIntent
+
+load_dotenv()
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
-class PlanRequestToolConfig(BaseToolConfig):
-    llm_key: str = Field(..., description="LiteLLM proxy API key ")
-    model_name : str = Field(..., description = "MODEL NAME")
+
+def _use_vertex_ai() -> bool:
+    return _env_flag("GOOGLE_GENAI_USE_VERTEXAI", default=False)
 
 
-class PlanRequestTool(BaseTool[UserRequest, IntentOutSchema]):
-    input_schema = UserRequest
-    output_schema = IntentOutSchema
+def _default_model_name() -> str:
+    if _use_vertex_ai():
+        return os.getenv("INFORMATION_AGENT_MODEL") or "gemini-2.5-flash"
+    return (
+        os.getenv("INTENT_MODEL")
+        or os.getenv("INFORMATION_AGENT_MODEL")
+        or os.getenv("OPENAI_MODEL")
+        or "gpt-4.1-mini"
+    )
 
-    def __init__(self, config: PlanRequestToolConfig):
+
+class IntentClassificationInput(BaseIOSchema):
+    """Input for intent decomposition."""
+
+    user_request: str = Field(..., description="The user's topic query")
+    deep_research: bool = Field(
+        default=False,
+        description="Whether the user wants a deep-research pass",
+    )
+
+
+class IntentClassificationToolConfig(BaseToolConfig):
+    """LLM configuration for intent decomposition."""
+
+    model_name: str = Field(default_factory=_default_model_name)
+
+
+def build_fallback_intent_decomposition(
+    user_request: str, deep_research: bool
+) -> IntentDecomposition:
+    base_queries = [
+        SearchIntent(
+            label="Core entities",
+            query=user_request,
+            purpose="Find the main entities directly related to the user query.",
+        ),
+        SearchIntent(
+            label="Official sources",
+            query=f"{user_request} official websites",
+            purpose="Find official sites or canonical pages for the entities.",
+        ),
+        SearchIntent(
+            label="Comparison pages",
+            query=f"{user_request} best top list",
+            purpose="Find curated lists or comparison sources with multiple entities.",
+        ),
+    ]
+
+    if deep_research:
+        base_queries.extend(
+            [
+                SearchIntent(
+                    label="Reviews and analysis",
+                    query=f"{user_request} reviews comparison",
+                    purpose="Find second-order sources that compare or evaluate entities.",
+                ),
+                SearchIntent(
+                    label="Directories",
+                    query=f"{user_request} directory database",
+                    purpose="Find directories or databases listing many matching entities.",
+                ),
+                SearchIntent(
+                    label="Location and metadata",
+                    query=f"{user_request} location pricing features",
+                    purpose="Find pages that expose comparable attributes for each entity.",
+                ),
+            ]
+        )
+
+    return IntentDecomposition(
+        user_query=user_request,
+        research_depth="deep" if deep_research else "standard",
+        entity_type="entity",
+        intent_summary=(
+            "Discover entities matching the topic query and compare them using "
+            "source-backed attributes."
+        ),
+        comparison_axes=["name", "summary", "location", "website"],
+        search_requests=base_queries,
+    )
+
+
+class IntentClassificationTool(
+    BaseTool[IntentClassificationInput, IntentDecomposition]
+):
+    """Decompose a user query into research-ready sub-intents."""
+
+    def __init__(
+        self, config: IntentClassificationToolConfig = IntentClassificationToolConfig()
+    ):
         super().__init__(config)
         self.model_name = config.model_name
 
+    def _run_vertex(self, params: IntentClassificationInput) -> IntentDecomposition:
+        from google import genai
+        from google.genai import types
 
-    async def run(self, params: UserRequest, parallel: bool = False) -> IntentOutSchema:
-        schema_def = json.dumps(IntentOutSchema.model_json_schema(), indent=2)
-        system = (
-            "You are an intent planner for a web-information gatherer.\n"
-            "Goal: convert the user query into a short list of search-ready intent requests.\n"
-            "Rules:\n"
-            "- Each intent must be a standalone natural-language request.\n"
-            "- Make intents non-overlapping (no near-duplicates).\n"
-            "- Prefer action verbs: Find / Compare / List / Explain / Summarize / Extract.\n"
-            "- No numbering, no extra keys, no commentary. Output must match the schema: {schema_def}.\n"
+        project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+        if not project:
+            raise ValueError(
+                "GOOGLE_CLOUD_PROJECT must be set when GOOGLE_GENAI_USE_VERTEXAI=True."
+            )
+
+        client = genai.Client(
+            vertexai=True,
+            project=project,
+            location=os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global",
+            http_options=types.HttpOptions(api_version="v1"),
         )
 
-        user = (
-            "Create intent_requests for the following query.\n\n"
-            f"QUERY:\n{params['user_request']}\n"
+        system_prompt = (
+            "You decompose a user topic query into a compact research plan for an "
+            "entity-discovery pipeline. Return valid JSON matching the provided schema."
         )
+        user_prompt = f"""
+User query:
+{params.user_request}
 
-        resp = await acompletion(
-            model=f"deepinfra/{self.model_name}",
+Deep research requested:
+{params.deep_research}
+
+Return an IntentDecomposition with:
+- research_depth = "deep" if deep_research is true, otherwise "standard"
+- 3 to 5 search_requests for standard research
+- 6 to 8 search_requests for deep research
+- non-overlapping search queries
+- comparison_axes that help compare entities for this topic
+- a specific entity_type and intent_summary
+"""
+
+        response = client.models.generate_content(
+            model=self.model_name,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=IntentDecomposition,
+            ),
+        )
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, IntentDecomposition):
+            return parsed
+        if parsed is not None:
+            return IntentDecomposition.model_validate(parsed)
+        if response.text:
+            return IntentDecomposition.model_validate_json(response.text)
+        raise ValueError("Vertex AI returned no parseable IntentDecomposition.")
+
+    def _run_openai(self, params: IntentClassificationInput) -> IntentDecomposition:
+        api_key = os.getenv("PROVIDER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY or PROVIDER_API_KEY is required.")
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url=os.getenv("PROVIDER_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+        )
+        response = client.chat.completions.create(
+            model=self.model_name,
+            temperature=0,
+            response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": system.format(schema_def= schema_def)},
-                {"role": "user", "content": user},
+                {
+                    "role": "system",
+                    "content": (
+                        "You decompose a user topic query into a compact research plan "
+                        "for an entity-discovery pipeline. Return JSON only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"User query:\n{params.user_request}\n\n"
+                        f"Deep research requested:\n{params.deep_research}\n\n"
+                        "Return an IntentDecomposition with:\n"
+                        '- research_depth = "deep" if deep_research is true, '
+                        'otherwise "standard"\n'
+                        "- 3 to 5 search_requests for standard research\n"
+                        "- 6 to 8 search_requests for deep research\n"
+                        "- non-overlapping search queries\n"
+                        "- comparison_axes that help compare entities for this topic\n"
+                        "- a specific entity_type and intent_summary\n"
+                    ),
+                },
             ],
-            response_format={ "type": "json_object" },
-            temperature=0.2
         )
-        content = (resp.choices[0].message.content or "")
-        out = IntentOutSchema.model_validate_json(content)
-        return out
+        content = response.choices[0].message.content or "{}"
+        return IntentDecomposition.model_validate_json(content)
+
+    def run(self, params: IntentClassificationInput) -> IntentDecomposition:
+        try:
+            if _use_vertex_ai():
+                return self._run_vertex(params)
+            return self._run_openai(params)
+        except Exception:
+            return build_fallback_intent_decomposition(
+                params.user_request,
+                params.deep_research,
+            )

@@ -1,3 +1,6 @@
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import trafilatura
 from atomic_agents import BaseIOSchema, BaseTool, BaseToolConfig
 from pydantic import Field
@@ -28,30 +31,42 @@ class FetchURLTool(BaseTool[FetchURLToolInputSchema, FetchURLToolOutputSchema]):
 
     def __init__(self, config: BaseToolConfig = BaseToolConfig()):
         super().__init__(config)
+        self.max_workers = max(
+            1,
+            int(os.getenv("FETCH_URL_MAX_WORKERS", "6")),
+        )
+
+    def _fetch_one(self, url: str) -> str:
+        try:
+            downloaded = trafilatura.fetch_url(url)
+            if downloaded is None:
+                return f"[FETCH FAILED] Could not download: {url}"
+
+            text = trafilatura.extract(
+                downloaded,
+                url=url,
+                favor_recall=True,
+                include_tables=True,
+                include_images=False,
+                output_format="markdown",
+                deduplicate=True,
+            )
+            return text or f"[EXTRACT FAILED] No content extracted from: {url}"
+        except Exception as exc:
+            return f"[ERROR] {url} :: {type(exc).__name__}: {exc}"
 
     def run(self, params: FetchURLToolInputSchema) -> FetchURLToolOutputSchema:
-        results: list[str] = []
+        urls = params.value
+        if not urls:
+            return FetchURLToolOutputSchema(result=[])
 
-        for url in params.value:
-            try:
-                downloaded = trafilatura.fetch_url(url)
-                if downloaded is None:
-                    results.append(f"[FETCH FAILED] Could not download: {url}")
-                    continue
+        worker_count = min(self.max_workers, len(urls))
+        if worker_count == 1:
+            results = [self._fetch_one(url) for url in urls]
+            return FetchURLToolOutputSchema(result=results)
 
-                text = trafilatura.extract(
-                    downloaded,
-                    url=url,
-                    favor_recall=True,
-                    include_tables=True,
-                    include_images=False,
-                    output_format="markdown",
-                    deduplicate=True,
-                )
-                results.append(
-                    text or f"[EXTRACT FAILED] No content extracted from: {url}"
-                )
-            except Exception as exc:
-                results.append(f"[ERROR] {url} :: {type(exc).__name__}: {exc}")
+        # executor.map preserves input order, so downstream URL/result zipping still works
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(self._fetch_one, urls))
 
         return FetchURLToolOutputSchema(result=results)
