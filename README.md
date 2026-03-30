@@ -2,6 +2,18 @@
 
 This project builds a topic-driven entity discovery workflow around [`info_agent.py`].
 
+
+# RUNS INFORMATION
+
+| Runs | Latency(sec) | 
+|---|---|
+| Normal Search (v1) | 130 | 
+| DeepSearch (v1) | 230 | 
+| Normal Search (v2) | 52.3 | 
+| DeepSearch (v2) | 132.04 | 
+
+
+
 Given a query like:
 
 - `AI startups in healthcare`
