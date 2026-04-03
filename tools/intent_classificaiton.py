@@ -1,36 +1,18 @@
 import json
-import os
 
 from atomic_agents import BaseIOSchema, BaseTool, BaseToolConfig
-from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import Field
 
 from schema import IntentDecomposition, SearchIntent
-
-load_dotenv()
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _use_vertex_ai() -> bool:
-    return _env_flag("GOOGLE_GENAI_USE_VERTEXAI", default=False)
-
-
-def _default_model_name() -> str:
-    if _use_vertex_ai():
-        return os.getenv("INFORMATION_AGENT_MODEL") or "gemini-2.5-flash"
-    return (
-        os.getenv("INTENT_MODEL")
-        or os.getenv("INFORMATION_AGENT_MODEL")
-        or os.getenv("OPENAI_MODEL")
-        or "gpt-4.1-mini"
-    )
+from utils.config import (
+    get_api_key,
+    get_base_url,
+    get_intent_model_name,
+    get_vertex_location,
+    get_vertex_project,
+    use_vertex_ai,
+)
 
 
 class IntentClassificationInput(BaseIOSchema):
@@ -46,7 +28,7 @@ class IntentClassificationInput(BaseIOSchema):
 class IntentClassificationToolConfig(BaseToolConfig):
     """LLM configuration for intent decomposition."""
 
-    model_name: str = Field(default_factory=_default_model_name)
+    model_name: str = Field(default_factory=get_intent_model_name)
 
 
 def build_fallback_intent_decomposition(
@@ -119,7 +101,7 @@ class IntentClassificationTool(
         from google import genai
         from google.genai import types
 
-        project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+        project = get_vertex_project()
         if not project:
             raise ValueError(
                 "GOOGLE_CLOUD_PROJECT must be set when GOOGLE_GENAI_USE_VERTEXAI=True."
@@ -128,8 +110,11 @@ class IntentClassificationTool(
         client = genai.Client(
             vertexai=True,
             project=project,
-            location=os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global",
-            http_options=types.HttpOptions(api_version="v1"),
+            location=get_vertex_location(),
+            http_options=types.HttpOptions(
+                api_version="v1",
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
         )
 
         system_prompt = (
@@ -172,13 +157,14 @@ Return an IntentDecomposition with:
         raise ValueError("Vertex AI returned no parseable IntentDecomposition.")
 
     def _run_openai(self, params: IntentClassificationInput) -> IntentDecomposition:
-        api_key = os.getenv("PROVIDER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        api_key = get_api_key()
         if not api_key:
             raise ValueError("OPENAI_API_KEY or PROVIDER_API_KEY is required.")
 
         client = OpenAI(
             api_key=api_key,
-            base_url=os.getenv("PROVIDER_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+            base_url=get_base_url(),
+            max_retries=0,
         )
         response = client.chat.completions.create(
             model=self.model_name,
@@ -214,7 +200,7 @@ Return an IntentDecomposition with:
 
     def run(self, params: IntentClassificationInput) -> IntentDecomposition:
         try:
-            if _use_vertex_ai():
+            if use_vertex_ai():
                 return self._run_vertex(params)
             return self._run_openai(params)
         except Exception:

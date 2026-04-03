@@ -98,6 +98,26 @@ class IntentDecomposition(BaseIOSchema):
     )
 
 
+class MissingCellCandidate(BaseIOSchema):
+    """One candidate backfill for a missing cell."""
+
+    key: str = Field(..., description="Column key to populate")
+    value: str | None = Field(None, description="Backfilled value if found")
+    citations: list[SourceCitation] = Field(
+        default_factory=list,
+        description="Supporting citations for the backfilled value",
+    )
+
+
+class RecursiveResearchFill(BaseIOSchema):
+    """Structured output for recursive backfilling of missing cells."""
+
+    filled_cells: list[MissingCellCandidate] = Field(
+        default_factory=list,
+        description="Resolved missing cells for a specific entity",
+    )
+
+
 class InformationAgentInput(BaseIOSchema):
     """Input payload for the information agent."""
 
@@ -107,6 +127,13 @@ class InformationAgentInput(BaseIOSchema):
     deep_research: bool = Field(
         default=False,
         description="Whether to do a deeper, broader research pass",
+    )
+    recursive_research: bool = Field(
+        default=False,
+        description=(
+            "Whether to run an additional targeted search pass to backfill "
+            "missing attribute/value pairs"
+        ),
     )
     intent_decomposition: IntentDecomposition | None = Field(
         default=None,

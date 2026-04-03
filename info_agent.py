@@ -1,31 +1,15 @@
 import json
 import logging
-import os
-import re
 import time
-from pathlib import Path
-from typing import Any
+from typing import Callable
 
 import instructor
 from atomic_agents import AgentConfig, AtomicAgent, BaseToolConfig
 from atomic_agents.context import ChatHistory, SystemPromptGenerator
-from dotenv import load_dotenv
 from openai import OpenAI
 
 from prompts.information_agent_prompt import get_information_agent_system_prompt
-from schema import (
-    AgentAction,
-    EntityRow,
-    InformationAgentInput,
-    InformationAgentOutput,
-    IntentDecomposition,
-    SourceCitation,
-    SourceRecord,
-    StructuredEntityTable,
-    TableCell,
-    TableColumn,
-    ToolResult,
-)
+from schema import AgentAction, InformationAgentInput, InformationAgentOutput, IntentDecomposition, StructuredEntityTable, ToolResult
 from tools.fetch_url import FetchURLTool, FetchURLToolInputSchema
 from tools.intent_classificaiton import (
     IntentClassificationInput,
@@ -34,365 +18,85 @@ from tools.intent_classificaiton import (
 )
 from tools.web_search_tool import SearchTool, SearchToolConfig, SearchToolInput
 from tools.write_to_file import WriteToFileTool, WriteToFileToolInputSchema
+from utils.config import (
+    JSON_OUTPUT_PATH,
+    MARKDOWN_OUTPUT_PATH,
+    get_api_key,
+    get_base_url,
+    get_fetch_limit,
+    get_lightning_search_result_limit,
+    get_lightning_search_timeout_seconds,
+    get_loop_limit,
+    get_model_name,
+    get_search_result_limit,
+    get_vertex_location,
+    get_vertex_project,
+    use_vertex_ai,
+)
+from utils.lightning import run_lightning_research
+from utils.llm_utils import VertexInformationAgent
+from utils.progress import CliProgressReporter
+from utils.recursive_research import run_recursive_research
+from utils.result_utils import normalize_result
+from utils.text_utils import compact_text, render_markdown_document, truncate_content
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
 
-MAX_CONTENT_CHARS = 12000
-OUTPUT_DIR = Path("output/information_agent")
-JSON_OUTPUT_PATH = OUTPUT_DIR / "latest_entities.json"
-MARKDOWN_OUTPUT_PATH = OUTPUT_DIR / "latest_entities.md"
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _get_api_key() -> str:
-    return os.getenv("PROVIDER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-
-
-def _get_base_url() -> str | None:
-    return os.getenv("PROVIDER_BASE_URL") or os.getenv("OPENAI_BASE_URL")
-
-
-def _get_model_name() -> str:
-    default_model = "gemini-2.5-flash" if _use_vertex_ai() else "gpt-4.1-mini"
-    return (
-        os.getenv("INFORMATION_AGENT_MODEL")
-        or os.getenv("PROVIDER_MODEL")
-        or os.getenv("OPENAI_MODEL")
-        or default_model
-    )
-
-
-def _use_vertex_ai() -> bool:
-    return _env_flag("GOOGLE_GENAI_USE_VERTEXAI", default=False)
-
-
-def _get_vertex_project() -> str:
-    return os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
-
-
-def _get_vertex_location() -> str:
-    return os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global"
-
-
-def _get_search_result_limit(deep_research: bool) -> int:
-    return 12 if deep_research else 8
-
-
-def _get_fetch_limit(deep_research: bool) -> int:
-    return 12 if deep_research else 6
-
-
-def _get_loop_limit(deep_research: bool) -> int:
-    return 24 if deep_research else 16
-
-
-def _normalize_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
-
-
-def _slugify(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
-    return slug or "entity"
-
-
-def _compact_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    cleaned = " ".join(str(value).split()).strip()
-    return cleaned or None
-
-
-def _truncate_content(value: str, max_chars: int = MAX_CONTENT_CHARS) -> str:
-    if len(value) <= max_chars:
-        return value
-    trimmed = value[:max_chars].rsplit(" ", 1)[0].strip()
-    return f"{trimmed}\n\n[...truncated]"
-
-
-def _escape_markdown_cell(value: str) -> str:
-    compact = " ".join(value.split())
-    if len(compact) > 100:
-        compact = f"{compact[:97].rstrip()}..."
-    return compact.replace("|", "\\|")
-
-
-def _render_table_markdown(result: StructuredEntityTable) -> str:
-    if not result.rows:
-        return "_No entities extracted._"
-
-    headers = [column.label for column in result.columns]
-    lines = [
-        f"| {' | '.join(headers)} |",
-        f"| {' | '.join(['---'] * len(headers))} |",
-    ]
-
-    for row in result.rows:
-        normalized_cells = {
-            _normalize_key(key): cell for key, cell in (row.cells or {}).items()
-        }
-        values = []
-        for column in result.columns:
-            cell = normalized_cells.get(column.key)
-            values.append(_escape_markdown_cell(cell.value) if cell and cell.value else "")
-        lines.append(f"| {' | '.join(values)} |")
-
-    return "\n".join(lines)
-
-
-def _render_markdown_document(result: StructuredEntityTable) -> str:
-    lines = [
-        f"# {result.title}",
-        "",
-        f"Query: `{result.query}`",
-        "",
-        "## Entity Table",
-        _render_table_markdown(result),
-        "",
-        "## Sources",
-    ]
-
-    for source in result.sources:
-        lines.append(f"- `{source.source_id}`: [{source.title}]({source.url})")
-
-    return "\n".join(lines)
-
-
-def _normalize_result(
-    result: StructuredEntityTable,
-    query: str,
-    source_registry: dict[str, dict[str, str | None]],
-) -> StructuredEntityTable:
-    normalized_columns: list[TableColumn] = []
-    seen_column_keys: set[str] = set()
-
-    for column in result.columns:
-        key = _normalize_key(column.key or column.label)
-        if not key or key in seen_column_keys:
-            continue
-        normalized_columns.append(
-            TableColumn(
-                key=key,
-                label=_compact_text(column.label) or key.replace("_", " ").title(),
-                description=_compact_text(column.description) or "",
-            )
+def create_information_tools(
+    deep_research: bool = False,
+    lightning: bool = False,
+):
+    if lightning:
+        search_config = SearchToolConfig(
+            max_results=get_lightning_search_result_limit(),
+            timeout_seconds=get_lightning_search_timeout_seconds(),
         )
-        seen_column_keys.add(key)
-
-    if "name" not in seen_column_keys:
-        normalized_columns.insert(
-            0,
-            TableColumn(
-                key="name",
-                label="Name",
-                description="Name of the discovered entity",
-            ),
-        )
-        seen_column_keys.add("name")
-
-    normalized_rows: list[EntityRow] = []
-    used_source_ids: set[str] = set()
-
-    for row in result.rows:
-        raw_cells = {_normalize_key(key): cell for key, cell in (row.cells or {}).items()}
-        cleaned_cells: dict[str, TableCell] = {}
-
-        for column in normalized_columns:
-            cell = raw_cells.get(column.key)
-            if not cell or not _compact_text(cell.value):
-                continue
-
-            citations: list[SourceCitation] = []
-            for citation in cell.citations or []:
-                source_id = _compact_text(citation.source_id)
-                source_meta = source_registry.get(source_id or "", {})
-                source_title = _compact_text(citation.source_title) or _compact_text(
-                    source_meta.get("title")
-                )
-                source_url = _compact_text(citation.source_url) or _compact_text(
-                    source_meta.get("url")
-                )
-                quote = _compact_text(citation.quote)
-
-                if not source_id or not source_title or not source_url or not quote:
-                    continue
-
-                citations.append(
-                    SourceCitation(
-                        source_id=source_id,
-                        source_title=source_title,
-                        source_url=source_url,
-                        quote=quote,
-                    )
-                )
-                used_source_ids.add(source_id)
-
-            if not citations:
-                continue
-
-            cleaned_cells[column.key] = TableCell(
-                value=_compact_text(cell.value),
-                citations=citations,
-            )
-
-        name_cell = cleaned_cells.get("name")
-        if not name_cell or not name_cell.value:
-            continue
-
-        normalized_rows.append(
-            EntityRow(
-                entity_id=_slugify(name_cell.value),
-                cells=cleaned_cells,
-            )
+    else:
+        search_config = SearchToolConfig(
+            max_results=get_search_result_limit(deep_research)
         )
 
-    normalized_sources = [
-        SourceRecord(
-            source_id=source_id,
-            title=_compact_text(source_registry[source_id].get("title")) or source_id,
-            url=_compact_text(source_registry[source_id].get("url")) or "",
-            snippet=_compact_text(source_registry[source_id].get("snippet")),
-        )
-        for source_id in sorted(used_source_ids)
-        if source_id in source_registry and _compact_text(source_registry[source_id].get("url"))
-    ]
+    tools = {
+        "search_tool": SearchTool(search_config),
+        "fetch_url_tool": FetchURLTool(BaseToolConfig()),
+        "write_file_tool": WriteToFileTool(BaseToolConfig()),
+    }
 
-    return StructuredEntityTable(
-        query=query,
-        title=_compact_text(result.title) or f"Discovered entities for {query}",
-        columns=normalized_columns,
-        rows=normalized_rows,
-        sources=normalized_sources,
-    )
+    if not lightning:
+        tools["intent_tool"] = IntentClassificationTool(IntentClassificationToolConfig())
 
-
-class SimpleChatHistory:
-    def __init__(self) -> None:
-        self.messages: list[dict[str, str]] = []
-
-    def add_message(self, role: str, content: Any) -> None:
-        if hasattr(content, "model_dump_json"):
-            serialized = content.model_dump_json(indent=2)
-        elif isinstance(content, str):
-            serialized = content
-        else:
-            serialized = json.dumps(content, ensure_ascii=False, indent=2)
-
-        self.messages.append({"role": role, "content": serialized})
-
-
-class VertexInformationAgent:
-    """A minimal agent wrapper that preserves the current loop for Vertex AI."""
-
-    def __init__(self, model: str, system_prompt: str, project: str, location: str):
-        from google import genai
-        from google.genai import types
-
-        self._types = types
-        self.client = genai.Client(
-            vertexai=True,
-            project=project,
-            location=location,
-            http_options=types.HttpOptions(api_version="v1"),
-        )
-        self.model = model
-        self.system_prompt = system_prompt
-        self.history = SimpleChatHistory()
-        self.initial_input: InformationAgentInput | None = None
-
-    def _build_prompt(self) -> str:
-        if self.initial_input is None:
-            raise ValueError("InformationAgentInput is required for the first run.")
-
-        parts = [
-            "Original topic query:",
-            self.initial_input.information_request,
-            f"Deep research requested: {self.initial_input.deep_research}",
-        ]
-
-        if self.initial_input.intent_decomposition is not None:
-            parts.extend(
-                [
-                    "Intent decomposition:",
-                    self.initial_input.intent_decomposition.model_dump_json(indent=2),
-                ]
-            )
-
-        if self.history.messages:
-            parts.append(
-                "Tool execution history so far. Use these results as grounding for the next AgentAction."
-            )
-            for index, message in enumerate(self.history.messages, start=1):
-                parts.append(
-                    f"History item {index} ({message['role']}):\n{message['content']}"
-                )
-
-        return "\n\n".join(parts)
-
-    def run(self, payload: InformationAgentInput | None = None) -> AgentAction:
-        if payload is not None:
-            self.initial_input = payload
-
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=self._build_prompt(),
-            config=self._types.GenerateContentConfig(
-                system_instruction=self.system_prompt,
-                temperature=0,
-                response_mime_type="application/json",
-                response_schema=AgentAction,
-            ),
-        )
-
-        usage = getattr(response, "usage_metadata", None)
-        if usage:
-            logger.debug(
-                "tokens - prompt=%s, completion=%s, total=%s",
-                getattr(usage, "prompt_token_count", 0),
-                getattr(usage, "candidates_token_count", 0),
-                getattr(usage, "total_token_count", 0),
-            )
-
-        parsed = getattr(response, "parsed", None)
-        if isinstance(parsed, AgentAction):
-            return parsed
-        if parsed is not None:
-            return AgentAction.model_validate(parsed)
-        if response.text:
-            return AgentAction.model_validate_json(response.text)
-
-        raise ValueError("Vertex AI returned no parseable AgentAction.")
+    return tools
 
 
 def create_information_agent(deep_research: bool = False):
     """Create the agent and tools for the agentic research loop."""
-    if _use_vertex_ai():
-        project = _get_vertex_project()
+    if use_vertex_ai():
+        from google.genai import types
+
+        project = get_vertex_project()
         if not project:
             raise ValueError(
                 "GOOGLE_CLOUD_PROJECT must be set when GOOGLE_GENAI_USE_VERTEXAI=True."
             )
 
         agent = VertexInformationAgent(
-            model=_get_model_name(),
+            model=get_model_name(),
             system_prompt=get_information_agent_system_prompt(),
             project=project,
-            location=_get_vertex_location(),
+            location=get_vertex_location(),
+            http_options=types.HttpOptions(
+                api_version="v1",
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
         )
     else:
-        api_key = _get_api_key()
+        api_key = get_api_key()
         if not api_key:
             raise ValueError(
                 "Set OPENAI_API_KEY or PROVIDER_API_KEY, or set "
@@ -401,14 +105,15 @@ def create_information_agent(deep_research: bool = False):
 
         openai_client = OpenAI(
             api_key=api_key,
-            base_url=_get_base_url(),
+            base_url=get_base_url(),
+            max_retries=0,
         )
         client = instructor.from_openai(openai_client, mode=instructor.Mode.JSON)
 
         agent = AtomicAgent[InformationAgentInput, AgentAction](
             config=AgentConfig(
                 client=client,
-                model=_get_model_name(),
+                model=get_model_name(),
                 history=ChatHistory(),
                 system_prompt_generator=SystemPromptGenerator(
                     background=[get_information_agent_system_prompt()]
@@ -428,25 +133,35 @@ def create_information_agent(deep_research: bool = False):
 
         agent.register_hook("completion:response", _on_completion_response)
 
-    tools = {
-        "intent_tool": IntentClassificationTool(IntentClassificationToolConfig()),
-        "search_tool": SearchTool(
-            SearchToolConfig(max_results=_get_search_result_limit(deep_research))
-        ),
-        "fetch_url_tool": FetchURLTool(BaseToolConfig()),
-        "write_file_tool": WriteToFileTool(BaseToolConfig()),
-    }
+    tools = create_information_tools(deep_research=deep_research)
 
     return agent, tools
 
 
 def run_information_agent(
-    information_request: str, deep_research: bool = False
+    information_request: str,
+    deep_research: bool = False,
+    recursive_research: bool = False,
+    lightning: bool = False,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> str:
-    """
-    Run the agentic entity-discovery loop and return a JSON string.
-    """
+    """Run the agentic entity-discovery loop and return a JSON string."""
+    progress_callback = progress_callback or (lambda _message: None)
+    if lightning:
+        progress_callback("Initializing lightning mode")
+        tools = create_information_tools(lightning=True)
+        result = run_lightning_research(
+            information_request=information_request,
+            search_tool=tools["search_tool"],
+            fetch_tool=tools["fetch_url_tool"],
+            write_tool=tools["write_file_tool"],
+            progress_callback=progress_callback,
+        )
+        progress_callback("Completed")
+        return result.model_dump_json(indent=2)
+
     start_time = time.perf_counter()
+    progress_callback("Initializing agent")
     agent, tools = create_information_agent(deep_research=deep_research)
 
     intent_tool = tools["intent_tool"]
@@ -454,14 +169,16 @@ def run_information_agent(
     fetch_tool = tools["fetch_url_tool"]
     write_tool = tools["write_file_tool"]
 
-    fetch_limit = _get_fetch_limit(deep_research)
-    loop_limit = _get_loop_limit(deep_research)
+    fetch_limit = get_fetch_limit(deep_research)
+    loop_limit = get_loop_limit(deep_research)
     fetch_count = 0
     queries_run: list[dict[str, object]] = []
     total_results = 0
     json_file_path = ""
     markdown_file_path = ""
     final_table: StructuredEntityTable | None = None
+    recursive_research_meta: dict[str, object] = {"enabled": recursive_research}
+    progress_callback("Decomposing intent")
     intent_decomposition: IntentDecomposition = intent_tool.run(
         IntentClassificationInput(
             user_request=information_request,
@@ -473,17 +190,18 @@ def run_information_agent(
     url_to_source_id: dict[str, str] = {}
 
     logger.info("starting entity discovery for topic query")
-
     logger.info(
         "intent decomposition ready: depth=%s, search_requests=%d",
         intent_decomposition.research_depth,
         len(intent_decomposition.search_requests),
     )
 
+    progress_callback("Planning research")
     action: AgentAction = agent.run(
         InformationAgentInput(
             information_request=information_request,
             deep_research=deep_research,
+            recursive_research=recursive_research,
             intent_decomposition=intent_decomposition,
         )
     )
@@ -503,14 +221,42 @@ def run_information_agent(
                     {"error": "search_query was empty"}, ensure_ascii=False
                 )
             else:
+                progress_callback(f"Searching web (iteration {iteration})")
                 logger.info("  search_web: querying %r", query)
                 output = search_tool.run(SearchToolInput(value=query))
 
+                if output.error:
+                    queries_run.append(
+                        {
+                            "query": query,
+                            "results": 0,
+                            "error": output.error,
+                        }
+                    )
+                    tool_result_str = json.dumps(
+                        {
+                            "query": query,
+                            "results": [],
+                            "error": output.error,
+                        },
+                        ensure_ascii=False,
+                    )
+                    logger.warning("  search_web failed: %s", output.error)
+                    agent.history.add_message(
+                        "user",
+                        ToolResult(tool_name=action.action_type, result=tool_result_str),
+                    )
+                    progress_callback(f"Thinking about next step (iteration {iteration})")
+                    action = agent.run()
+                    continue
+
                 enriched_results: list[dict[str, object]] = []
                 for item in output.results:
-                    url = _compact_text(str(item.get("href") or item.get("url") or ""))
-                    title = _compact_text(str(item.get("title") or ""))
-                    snippet = _compact_text(str(item.get("body") or item.get("snippet") or ""))
+                    url = compact_text(str(item.get("href") or item.get("url") or ""))
+                    title = compact_text(str(item.get("title") or ""))
+                    snippet = compact_text(
+                        str(item.get("body") or item.get("snippet") or "")
+                    )
                     if not url or not title:
                         continue
 
@@ -558,6 +304,9 @@ def run_information_agent(
                     )
                 else:
                     fetch_count += 1
+                    progress_callback(
+                        f"Fetching {len(deduped_urls)} page(s) ({fetch_count}/{fetch_limit})"
+                    )
                     logger.info(
                         "  fetch_url: fetching %d URL(s) [call %d/%d]",
                         len(deduped_urls),
@@ -567,6 +316,7 @@ def run_information_agent(
                     output = fetch_tool.run(FetchURLToolInputSchema(value=deduped_urls))
 
                     fetched_records: list[dict[str, object]] = []
+                    failed_fetches: list[dict[str, object]] = []
                     for url, content in zip(deduped_urls, output.result):
                         source_id = url_to_source_id.get(url)
                         if not source_id:
@@ -580,29 +330,62 @@ def run_information_agent(
                             }
 
                         metadata = source_registry[source_id]
+                        if fetch_tool.is_error_result(content):
+                            failed_fetches.append(
+                                {
+                                    "source_id": source_id,
+                                    "title": metadata.get("title") or url,
+                                    "url": url,
+                                    "snippet": metadata.get("snippet"),
+                                    "error": content,
+                                }
+                            )
+                            continue
+
                         fetched_records.append(
                             {
                                 "source_id": source_id,
                                 "title": metadata.get("title") or url,
                                 "url": url,
                                 "snippet": metadata.get("snippet"),
-                                "content": _truncate_content(content),
+                                "content": truncate_content(content),
                             }
                         )
 
-                    tool_result_str = json.dumps(fetched_records, ensure_ascii=False)
+                    tool_result_str = json.dumps(
+                        {
+                            "fetched_records": fetched_records,
+                            "failed_fetches": failed_fetches,
+                        },
+                        ensure_ascii=False,
+                    )
 
         elif action.action_type == "finish":
             if action.final_result is None:
                 raise ValueError("Agent returned finish without final_result.")
 
-            final_table = _normalize_result(
+            progress_callback("Normalizing results")
+            final_table = normalize_result(
                 action.final_result,
                 query=information_request,
                 source_registry=source_registry,
+                require_complete=not recursive_research,
             )
+            if recursive_research:
+                progress_callback("Running recursive research")
+                final_table, recursive_research_meta = run_recursive_research(
+                    result=final_table,
+                    original_query=information_request,
+                    deep_research=deep_research,
+                    search_tool=search_tool,
+                    fetch_tool=fetch_tool,
+                    source_registry=source_registry,
+                    url_to_source_id=url_to_source_id,
+                    progress_callback=progress_callback,
+                )
+            progress_callback("Writing output files")
             json_payload = final_table.model_dump_json(indent=2)
-            markdown_payload = _render_markdown_document(final_table)
+            markdown_payload = render_markdown_document(final_table)
 
             json_write = write_tool.run(
                 WriteToFileToolInputSchema(
@@ -629,6 +412,7 @@ def run_information_agent(
             "user",
             ToolResult(tool_name=action.action_type, result=tool_result_str),
         )
+        progress_callback(f"Thinking about next step (iteration {iteration})")
         action = agent.run()
     else:
         logger.warning(
@@ -655,15 +439,17 @@ def run_information_agent(
         result=final_table,
         meta={
             "deep_research": deep_research,
+            "recursive_research": recursive_research_meta,
             "intent_decomposition": intent_decomposition.model_dump(),
             "queries_run": queries_run,
             "total_results": total_results,
             "fetch_calls": fetch_count,
             "fetch_limit": fetch_limit,
             "execution_time_ms": execution_time_ms,
-            "model": _get_model_name(),
+            "model": get_model_name(),
         },
     )
+    progress_callback("Completed")
     return result.model_dump_json(indent=2)
 
 
@@ -677,15 +463,12 @@ def resolve_deep_research_choice(explicit_choice: bool | None = None) -> bool:
 
 if __name__ == "__main__":
     import argparse
-    import time
 
     parser = argparse.ArgumentParser(
         description="Discover entities for a topic query using the info agent."
     )
     parser.add_argument("query", help="Topic query to search and structure")
     group = parser.add_mutually_exclusive_group()
-
-    
     group.add_argument(
         "--deep-research",
         dest="deep_research",
@@ -699,13 +482,39 @@ if __name__ == "__main__":
         action="store_false",
         help="Run the standard research pass",
     )
-    args = parser.parse_args()
-    time_st = time.time()
-    print(
-        run_information_agent(
-            args.query,
-            deep_research=resolve_deep_research_choice(args.deep_research),
-        )
+    parser.add_argument(
+        "--recursive-research",
+        action="store_true",
+        help=(
+            "Run a targeted follow-up search pass that backfills missing "
+            "attribute/value pairs into the original table"
+        ),
     )
-    time_end = time.time()
-    print("Processing time:", time_end - time_st)
+    parser.add_argument(
+        "--lightning",
+        action="store_true",
+        help=(
+            "Run a speed-optimized pass that uses one compact search/fetch/extract "
+            "cycle and aims to finish in under 10 seconds"
+        ),
+    )
+    args = parser.parse_args()
+    if args.lightning and args.deep_research is True:
+        parser.error("--lightning cannot be combined with --deep-research")
+    if args.lightning and args.recursive_research:
+        parser.error("--lightning cannot be combined with --recursive-research")
+
+    with CliProgressReporter() as progress:
+        result = run_information_agent(
+            args.query,
+            deep_research=(
+                False
+                if args.lightning
+                else resolve_deep_research_choice(args.deep_research)
+            ),
+            recursive_research=(False if args.lightning else args.recursive_research),
+            lightning=args.lightning,
+            progress_callback=progress.update,
+        )
+        progress.complete("Completed")
+    print(result)

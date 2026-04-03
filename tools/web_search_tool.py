@@ -1,12 +1,15 @@
 import os
+import logging
 
 import requests
 from atomic_agents import BaseIOSchema, BaseTool, BaseToolConfig
 from ddgs import DDGS
-from dotenv import load_dotenv
+from ddgs.exceptions import DDGSException
 from pydantic import Field
 
-load_dotenv()
+from utils.config import get_search_provider, get_search_timeout_seconds
+
+logger = logging.getLogger(__name__)
 
 
 class SearchToolInput(BaseIOSchema):
@@ -22,19 +25,27 @@ class SearchToolOutput(BaseIOSchema):
         default_factory=list,
         description="Returned web search results",
     )
+    error: str | None = Field(
+        default=None,
+        description="Handled provider or network error, if the search failed",
+    )
 
 
 class SearchToolConfig(BaseToolConfig):
     """Tool configuration options."""
 
     provider: str = Field(
-        default_factory=lambda: os.getenv("SEARCH_PROVIDER", "duckduckgo")
+        default_factory=get_search_provider
     )
     api_key: str | None = Field(
         default_factory=lambda: os.getenv("SEARCH_TOOL_API_KEY")
         or os.getenv("BRAVE_API_KEY")
     )
     max_results: int = Field(default=10, description="Maximum results per search")
+    timeout_seconds: int = Field(
+        default_factory=get_search_timeout_seconds,
+        description="Timeout per search request in seconds",
+    )
 
 
 class SearchTool(BaseTool[SearchToolInput, SearchToolOutput]):
@@ -45,6 +56,7 @@ class SearchTool(BaseTool[SearchToolInput, SearchToolOutput]):
         self.provider = config.provider.strip().lower()
         self.api_key = config.api_key
         self.max_results = config.max_results
+        self.timeout_seconds = config.timeout_seconds
 
     def _search_brave(self, query: str) -> list[dict[str, object]]:
         if not self.api_key:
@@ -57,7 +69,7 @@ class SearchTool(BaseTool[SearchToolInput, SearchToolOutput]):
                 "X-Subscription-Token": self.api_key,
             },
             params={"q": query, "count": self.max_results},
-            timeout=30,
+            timeout=self.timeout_seconds,
         )
         response.raise_for_status()
         payload = response.json()
@@ -74,7 +86,7 @@ class SearchTool(BaseTool[SearchToolInput, SearchToolOutput]):
         ]
 
     def _search_duckduckgo(self, query: str) -> list[dict[str, object]]:
-        with DDGS() as ddgs:
+        with DDGS(timeout=self.timeout_seconds) as ddgs:
             raw_results = list(ddgs.text(query, max_results=self.max_results))
 
         return [
@@ -92,9 +104,24 @@ class SearchTool(BaseTool[SearchToolInput, SearchToolOutput]):
         if not query:
             return SearchToolOutput(results=[])
 
-        if self.provider == "brave":
-            results = self._search_brave(query)
-        else:
-            results = self._search_duckduckgo(query)
+        try:
+            if self.provider == "brave":
+                results = self._search_brave(query)
+            else:
+                results = self._search_duckduckgo(query)
+        except (DDGSException, requests.RequestException, ValueError) as exc:
+            error_message = (
+                f"{self.provider} search failed for query {query!r}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            logger.warning(error_message)
+            return SearchToolOutput(results=[], error=error_message)
+        except Exception as exc:
+            error_message = (
+                f"{self.provider} search failed unexpectedly for query {query!r}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            logger.warning(error_message)
+            return SearchToolOutput(results=[], error=error_message)
 
         return SearchToolOutput(results=results)

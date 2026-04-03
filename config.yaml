@@ -1,0 +1,46 @@
+output:
+  dir: output/information_agent
+  json_file: latest_entities.json
+  markdown_file: latest_entities.md
+
+content:
+  max_content_chars: 12000
+
+search:
+  provider: duckduckgo
+  timeout_seconds: 5
+
+fetch:
+  max_workers: 6
+  timeout_seconds: 30
+
+models:
+  openai_default: gpt-4.1-mini
+  vertex_default: gemini-2.5-flash
+  intent: null
+  lightning: null
+
+modes:
+  standard:
+    search_result_limit: 8
+    fetch_limit: 6
+    loop_limit: 16
+  deep:
+    search_result_limit: 12
+    fetch_limit: 12
+    loop_limit: 24
+  lightning:
+    deadline_seconds: 9.5
+    max_search_queries: 3
+    search_result_limit: 5
+    search_timeout_seconds: 3
+    fetch_url_limit: 3
+    max_content_chars: 3500
+    request_timeout_seconds: 4.5
+    result_row_limit: 5
+
+recursive_research:
+  max_rounds: 2
+  max_fetch_urls: 2
+  standard_search_result_limit: 3
+  deep_search_result_limit: 5

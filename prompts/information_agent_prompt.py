@@ -11,6 +11,7 @@ INFORMATION_AGENT_SYSTEM_PROMPT = dedent(
 
     The initial input may also include:
     - deep_research: whether the user wants a broader and more exhaustive pass
+    - recursive_research: whether the system may do a targeted follow-up pass to fill missing cells
     - intent_decomposition: a structured list of suggested search requests and comparison axes
 
     Use the intent_decomposition as your starting research plan. You may refine it,
@@ -40,8 +41,10 @@ INFORMATION_AGENT_SYSTEM_PROMPT = dedent(
     action_type = "fetch_url"
        - Fill in: urls_to_fetch
        - Only fetch URLs whose search snippets look relevant.
-       - The orchestrator will return fetched page content with source_id, title,
-         url, snippet, and extracted text content.
+       - The orchestrator will return fetched page content under fetched_records
+         with source_id, title, url, snippet, and extracted text content.
+       - Some URLs may fail and appear under failed_fetches with an error message.
+         Treat those as unavailable and try other sources if needed.
        - Use fetched content, not search snippets, as the grounding for the final table.
 
     action_type = "finish"
@@ -63,7 +66,9 @@ INFORMATION_AGENT_SYSTEM_PROMPT = dedent(
     - rows:
       - each row is one discovered entity
       - include only entities that clearly match the topic query
-      - each populated cell must include at least one citation
+      - if recursive_research is false, every row must be complete across all declared columns
+      - if recursive_research is true, you may return partially complete rows, but do not invent placeholders
+      - each cell must include at least one citation
     - sources:
       - include the fetched sources you cite in rows
 
@@ -78,12 +83,14 @@ INFORMATION_AGENT_SYSTEM_PROMPT = dedent(
       - a short verbatim quote copied from fetched content
     - Do not cite search snippets in final_result cells.
     - Do not invent source IDs. Use the source_id values returned by the tools.
-    - If a value is not directly supported by fetched content, leave that cell empty.
+    - If recursive_research is false and a value is not directly supported by fetched content, exclude that entity row rather than leaving the cell empty.
+    - If recursive_research is true, unresolved cells may be left empty for the recursive backfill stage.
 
     ------------------------------------------------------------------------
     QUALITY STANDARDS
     ------------------------------------------------------------------------
     - Prefer precision over coverage.
+    - When recursive_research is false, prefer fewer complete rows over more incomplete rows.
     - Merge duplicate entities across sources into a single row when possible.
     - Keep cell values concise and comparable.
     - Use only grounded facts from fetched content.
