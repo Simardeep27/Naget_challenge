@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 import time
 from functools import lru_cache
@@ -18,6 +19,8 @@ from utils.config import (
     get_vertex_project,
     use_vertex_ai,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=8)
@@ -196,101 +199,116 @@ def run_structured_generation(
                 else None
             ),
         )
+        direct_config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0,
+            response_mime_type="application/json",
+            response_schema=(None if google_search else response_schema),
+            max_output_tokens=max_output_tokens,
+            tools=(
+                [types.Tool(google_search=types.GoogleSearch())]
+                if google_search
+                else None
+            ),
+        )
+
+        def generate_without_cache():
+            return client.models.generate_content(
+                model=resolved_model_name,
+                contents=user_prompt,
+                config=direct_config,
+            )
+
         if vertex_cache_key and not google_search:
             ttl_seconds = max(
                 60,
                 vertex_cache_ttl_seconds or get_vertex_cache_ttl_seconds(),
             )
-            cache_entry = _load_vertex_cache_entry(
-                cache_key=vertex_cache_key,
-                model_name=resolved_model_name,
-            )
-            cache_name = str(cache_entry.get("cache_name") or "") if cache_entry else ""
-
-            if not cache_name:
-                cached_content = client.caches.create(
-                    model=resolved_model_name,
-                    config=types.CreateCachedContentConfig(
-                        display_name=(
-                            "info-agent-"
-                            f"{hashlib.sha256(vertex_cache_key.encode('utf-8')).hexdigest()[:16]}"
-                        ),
-                        system_instruction=system_prompt,
-                        contents=user_prompt,
-                        ttl=f"{ttl_seconds}s",
-                    ),
-                )
-                cache_name = str(cached_content.name or "")
-                if cache_name:
-                    _write_vertex_cache_entry(
-                        cache_key=vertex_cache_key,
-                        model_name=resolved_model_name,
-                        cache_name=cache_name,
-                        ttl_seconds=ttl_seconds,
-                    )
-
             try:
-                response = client.models.generate_content(
-                    model=resolved_model_name,
-                    contents="Generate the requested JSON response from the cached context.",
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        response_mime_type="application/json",
-                        response_schema=response_schema,
-                        max_output_tokens=max_output_tokens,
-                        cached_content=cache_name,
-                    ),
+                cache_entry = _load_vertex_cache_entry(
+                    cache_key=vertex_cache_key,
+                    model_name=resolved_model_name,
                 )
-            except Exception:
-                _delete_vertex_cache_entry(vertex_cache_key)
-                cached_content = client.caches.create(
-                    model=resolved_model_name,
-                    config=types.CreateCachedContentConfig(
-                        display_name=(
-                            "info-agent-"
-                            f"{hashlib.sha256(vertex_cache_key.encode('utf-8')).hexdigest()[:16]}"
+                cache_name = str(cache_entry.get("cache_name") or "") if cache_entry else ""
+
+                if not cache_name:
+                    cached_content = client.caches.create(
+                        model=resolved_model_name,
+                        config=types.CreateCachedContentConfig(
+                            display_name=(
+                                "info-agent-"
+                                f"{hashlib.sha256(vertex_cache_key.encode('utf-8')).hexdigest()[:16]}"
+                            ),
+                            system_instruction=system_prompt,
+                            contents=user_prompt,
+                            ttl=f"{ttl_seconds}s",
                         ),
-                        system_instruction=system_prompt,
-                        contents=user_prompt,
-                        ttl=f"{ttl_seconds}s",
-                    ),
-                )
-                cache_name = str(cached_content.name or "")
-                if cache_name:
-                    _write_vertex_cache_entry(
-                        cache_key=vertex_cache_key,
-                        model_name=resolved_model_name,
-                        cache_name=cache_name,
-                        ttl_seconds=ttl_seconds,
                     )
-                response = client.models.generate_content(
-                    model=resolved_model_name,
-                    contents="Generate the requested JSON response from the cached context.",
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        response_mime_type="application/json",
-                        response_schema=response_schema,
-                        max_output_tokens=max_output_tokens,
-                        cached_content=cache_name,
-                    ),
+                    cache_name = str(cached_content.name or "")
+                    if cache_name:
+                        _write_vertex_cache_entry(
+                            cache_key=vertex_cache_key,
+                            model_name=resolved_model_name,
+                            cache_name=cache_name,
+                            ttl_seconds=ttl_seconds,
+                        )
+
+                try:
+                    response = client.models.generate_content(
+                        model=resolved_model_name,
+                        contents="Generate the requested JSON response from the cached context.",
+                        config=types.GenerateContentConfig(
+                            temperature=0,
+                            response_mime_type="application/json",
+                            response_schema=response_schema,
+                            max_output_tokens=max_output_tokens,
+                            cached_content=cache_name,
+                        ),
+                    )
+                except Exception:
+                    _delete_vertex_cache_entry(vertex_cache_key)
+                    cached_content = client.caches.create(
+                        model=resolved_model_name,
+                        config=types.CreateCachedContentConfig(
+                            display_name=(
+                                "info-agent-"
+                                f"{hashlib.sha256(vertex_cache_key.encode('utf-8')).hexdigest()[:16]}"
+                            ),
+                            system_instruction=system_prompt,
+                            contents=user_prompt,
+                            ttl=f"{ttl_seconds}s",
+                        ),
+                    )
+                    cache_name = str(cached_content.name or "")
+                    if cache_name:
+                        _write_vertex_cache_entry(
+                            cache_key=vertex_cache_key,
+                            model_name=resolved_model_name,
+                            cache_name=cache_name,
+                            ttl_seconds=ttl_seconds,
+                        )
+                    response = client.models.generate_content(
+                        model=resolved_model_name,
+                        contents="Generate the requested JSON response from the cached context.",
+                        config=types.GenerateContentConfig(
+                            temperature=0,
+                            response_mime_type="application/json",
+                            response_schema=response_schema,
+                            max_output_tokens=max_output_tokens,
+                            cached_content=cache_name,
+                        ),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Vertex cached-content generation failed for %s; retrying without cache: %s: %s",
+                    response_schema.__name__,
+                    type(exc).__name__,
+                    exc,
                 )
+                _delete_vertex_cache_entry(vertex_cache_key)
+                response = generate_without_cache()
         else:
-            response = client.models.generate_content(
-                model=resolved_model_name,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=0,
-                    response_mime_type="application/json",
-                    response_schema=(None if google_search else response_schema),
-                    max_output_tokens=max_output_tokens,
-                    tools=(
-                        [types.Tool(google_search=types.GoogleSearch())]
-                        if google_search
-                        else None
-                    ),
-                ),
-            )
+            response = generate_without_cache()
 
         parsed = getattr(response, "parsed", None)
         if isinstance(parsed, response_schema):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
 from typing import Iterable
@@ -25,6 +26,8 @@ from tools.web_search_tool import SearchTool, SearchToolInput
 from utils.llm_utils import run_structured_generation
 from utils.result_utils import collect_sources_from_rows, normalize_result
 from utils.text_utils import compact_text, normalize_key, slugify, truncate_content
+
+logger = logging.getLogger(__name__)
 
 
 STOPWORDS = {
@@ -765,6 +768,7 @@ Only include entities that clearly satisfy the query constraints.
             vertex_cache_key=f"extract_table:{cache_key}",
         )
     except Exception:
+        logger.exception("Structured extraction failed for query %r", query)
         return StructuredEntityTable(
             query=query,
             title=_empty_table(query).title,
