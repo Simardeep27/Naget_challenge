@@ -14,15 +14,17 @@ function resolveAgentApiBase(): string {
 
 function buildForwardHeaders(request: Request): Headers {
   const headers = new Headers();
-  const contentType = request.headers.get("content-type");
-  const accept = request.headers.get("accept");
-
-  if (contentType) {
-    headers.set("content-type", contentType);
-  }
-
-  if (accept) {
-    headers.set("accept", accept);
+  for (const key of [
+    "accept",
+    "authorization",
+    "content-type",
+    "cookie",
+    "x-vercel-protection-bypass",
+  ]) {
+    const value = request.headers.get(key);
+    if (value) {
+      headers.set(key, value);
+    }
   }
 
   return headers;
@@ -53,6 +55,15 @@ export async function proxyAgentRequest(request: Request, path: string): Promise
       body,
       cache: "no-store",
     });
+
+    if (!upstream.ok) {
+      console.error("Agent proxy upstream returned a non-OK response", {
+        path,
+        agentApiBase,
+        status: upstream.status,
+        contentType: upstream.headers.get("content-type"),
+      });
+    }
 
     return new Response(upstream.body, {
       status: upstream.status,
