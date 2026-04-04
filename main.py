@@ -35,8 +35,7 @@ def main():
         "--lightning",
         action="store_true",
         help=(
-            "Run a speed-optimized pass that uses one compact search/fetch/extract "
-            "cycle and aims to finish in under 10 seconds"
+            "Run the same static pipeline with smaller search, preview, and fetch budgets"
         ),
     )
     args = parser.parse_args()
@@ -56,6 +55,7 @@ def main():
             recursive_research=(False if args.lightning else args.recursive_research),
             lightning=args.lightning,
             progress_callback=progress.update,
+            detail_callback=progress.log,
         )
         progress.complete("Completed")
     print(result)

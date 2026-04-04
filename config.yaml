@@ -13,6 +13,14 @@ search:
 fetch:
   max_workers: 6
   timeout_seconds: 30
+  cache_dir: .cache/fetch_url
+  cache_ttl_seconds: 86400
+  retrieval_passage_limit: 5
+  retrieval_neighbor_radius: 1
+
+vertex_cache:
+  dir: .cache/vertex_cache
+  ttl_seconds: 3600
 
 models:
   openai_default: gpt-4.1-mini
@@ -24,20 +32,14 @@ modes:
   standard:
     search_result_limit: 8
     fetch_limit: 6
-    loop_limit: 16
   deep:
     search_result_limit: 12
-    fetch_limit: 12
-    loop_limit: 24
+    fetch_limit: 3
   lightning:
-    deadline_seconds: 9.5
     max_search_queries: 3
     search_result_limit: 5
     search_timeout_seconds: 3
     fetch_url_limit: 3
-    max_content_chars: 3500
-    request_timeout_seconds: 4.5
-    result_row_limit: 5
 
 recursive_research:
   max_rounds: 2

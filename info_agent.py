@@ -1,141 +1,451 @@
-import json
-import logging
+from __future__ import annotations
+
 import time
+from dataclasses import dataclass, field
 from typing import Callable
 
-import instructor
-from atomic_agents import AgentConfig, AtomicAgent, BaseToolConfig
-from atomic_agents.context import ChatHistory, SystemPromptGenerator
-from openai import OpenAI
+from atomic_agents import BaseToolConfig
 
-from prompts.information_agent_prompt import get_information_agent_system_prompt
-from schema import AgentAction, InformationAgentInput, InformationAgentOutput, IntentDecomposition, StructuredEntityTable, ToolResult
-from tools.fetch_url import FetchURLTool, FetchURLToolInputSchema
-from tools.intent_classificaiton import (
-    IntentClassificationInput,
-    IntentClassificationTool,
-    IntentClassificationToolConfig,
+from schema import (
+    EntityRow,
+    InformationAgentOutput,
+    ResearchPlan,
+    SearchCandidate,
+    StructuredEntityTable,
 )
-from tools.web_search_tool import SearchTool, SearchToolConfig, SearchToolInput
+from tools.fetch_url import FetchURLTool
+from tools.research_planner import ResearchPlannerInput, ResearchPlannerTool
+from tools.web_search_tool import SearchTool, SearchToolConfig
 from tools.write_to_file import WriteToFileTool, WriteToFileToolInputSchema
 from utils.config import (
     JSON_OUTPUT_PATH,
     MARKDOWN_OUTPUT_PATH,
-    get_api_key,
-    get_base_url,
     get_fetch_limit,
+    get_lightning_fetch_url_limit,
+    get_lightning_max_search_queries,
     get_lightning_search_result_limit,
     get_lightning_search_timeout_seconds,
-    get_loop_limit,
     get_model_name,
     get_search_result_limit,
-    get_vertex_location,
-    get_vertex_project,
-    use_vertex_ai,
 )
-from utils.lightning import run_lightning_research
-from utils.llm_utils import VertexInformationAgent
 from utils.progress import CliProgressReporter
 from utils.recursive_research import run_recursive_research
 from utils.result_utils import normalize_result
-from utils.text_utils import compact_text, render_markdown_document, truncate_content
-
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+from utils.text_utils import render_markdown_document
+from utils.tiered_research import (
+    apply_semantic_rerank,
+    build_initial_search_queries,
+    extract_table_from_frontier,
+    fetch_frontier_records,
+    format_research_plan,
+    get_required_column_keys,
+    merge_tables,
+    run_candidate_search,
+    select_frontier_candidates,
 )
-logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PipelineBudgets:
+    """Execution budgets for one research run."""
+
+    mode: str
+    initial_query_budget: int
+    frontier_size: int
+    max_frontier_batches: int
+
+
+@dataclass
+class FrontierState:
+    """Mutable state accumulated while walking the frontier."""
+
+    working_table: StructuredEntityTable
+    remaining_candidates: list[SearchCandidate]
+    source_registry: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    url_to_source_id: dict[str, str] = field(default_factory=dict)
+    selected_frontier_urls: list[str] = field(default_factory=list)
+    fetched_records: list[dict[str, object]] = field(default_factory=list)
+    failed_fetches: list[dict[str, object]] = field(default_factory=list)
+    frontier_batch_count: int = 0
+    frontier_fetch_call_count: int = 0
+
+
+def _mode_name(*, deep_research: bool, lightning: bool) -> str:
+    if lightning:
+        return "lightning"
+    return "deep" if deep_research else "standard"
+
+
+def _search_query_budget(*, deep_research: bool, lightning: bool) -> int:
+    if lightning:
+        return get_lightning_max_search_queries()
+    return 4 if deep_research else 3
+
+
+def _fetch_budget(*, deep_research: bool, lightning: bool) -> int:
+    if lightning:
+        return get_lightning_fetch_url_limit()
+    if deep_research:
+        return min(get_fetch_limit(True), 3)
+    return get_fetch_limit(False)
+
+
+def _frontier_size(*, deep_research: bool, lightning: bool) -> int:
+    return min(
+        _fetch_budget(deep_research=deep_research, lightning=lightning),
+        5 if deep_research else 4,
+    )
+
+
+def _max_frontier_batches(*, deep_research: bool, lightning: bool) -> int:
+    frontier_size = _frontier_size(deep_research=deep_research, lightning=lightning)
+    fetch_budget = _fetch_budget(deep_research=deep_research, lightning=lightning)
+    return max(1, -(-fetch_budget // max(1, frontier_size)))
+
+
+def _extraction_chunk_size(*, deep_research: bool, lightning: bool) -> int:
+    if lightning:
+        return 2
+    return 3 if deep_research else 2
+
+
+def _empty_table(query: str) -> StructuredEntityTable:
+    return StructuredEntityTable(
+        query=query,
+        title=f"Discovered entities for {query}",
+        columns=[],
+        rows=[],
+        sources=[],
+    )
+
+
+def _flatten_query_history(
+    initial_queries: list[dict[str, object]],
+    *search_meta_objects: dict[str, object],
+) -> list[dict[str, object]]:
+    history = list(initial_queries)
+    for meta in search_meta_objects:
+        for item in meta.get("queries_run", []):
+            if isinstance(item, dict):
+                history.append(item)
+    return history
+
+
+def _build_pipeline_budgets(
+    *,
+    plan: ResearchPlan,
+    deep_research: bool,
+    lightning: bool,
+) -> PipelineBudgets:
+    return PipelineBudgets(
+        mode=_mode_name(deep_research=deep_research, lightning=lightning),
+        initial_query_budget=_search_query_budget(
+            deep_research=deep_research,
+            lightning=lightning,
+        ),
+        frontier_size=_frontier_size(
+            deep_research=deep_research,
+            lightning=lightning,
+        ),
+        max_frontier_batches=_max_frontier_batches(
+            deep_research=deep_research,
+            lightning=lightning,
+        ),
+    )
 
 
 def create_information_tools(
     deep_research: bool = False,
     lightning: bool = False,
-):
+) -> dict[str, object]:
     if lightning:
         search_config = SearchToolConfig(
             max_results=get_lightning_search_result_limit(),
             timeout_seconds=get_lightning_search_timeout_seconds(),
         )
     else:
-        search_config = SearchToolConfig(
-            max_results=get_search_result_limit(deep_research)
-        )
+        search_config = SearchToolConfig(max_results=get_search_result_limit(deep_research))
 
-    tools = {
+    return {
+        "planner_tool": ResearchPlannerTool(),
         "search_tool": SearchTool(search_config),
         "fetch_url_tool": FetchURLTool(BaseToolConfig()),
         "write_file_tool": WriteToFileTool(BaseToolConfig()),
     }
 
-    if not lightning:
-        tools["intent_tool"] = IntentClassificationTool(IntentClassificationToolConfig())
 
-    return tools
+def _finalize_table(
+    *,
+    table: StructuredEntityTable,
+    query: str,
+    plan: ResearchPlan,
+    source_registry: dict[str, dict[str, str | None]],
+) -> tuple[StructuredEntityTable, StructuredEntityTable]:
+    required_keys = get_required_column_keys(plan)
+    partial_table = normalize_result(
+        table,
+        query=query,
+        source_registry=source_registry,
+        require_complete=False,
+        required_column_keys=required_keys,
+    )
+    complete_table = normalize_result(
+        table,
+        query=query,
+        source_registry=source_registry,
+        require_complete=True,
+        required_column_keys=required_keys,
+    )
+    return complete_table, partial_table
 
 
-def create_information_agent(deep_research: bool = False):
-    """Create the agent and tools for the agentic research loop."""
-    if use_vertex_ai():
-        from google.genai import types
+def _prune_incomplete_columns(
+    table: StructuredEntityTable,
+) -> StructuredEntityTable:
+    if not table.rows:
+        return table
 
-        project = get_vertex_project()
-        if not project:
-            raise ValueError(
-                "GOOGLE_CLOUD_PROJECT must be set when GOOGLE_GENAI_USE_VERTEXAI=True."
+    keep_keys = {"name"}
+    for column in table.columns:
+        key = column.key
+        if key == "name":
+            continue
+        if all(
+            key in row.cells
+            and row.cells[key].value
+            and row.cells[key].citations
+            for row in table.rows
+        ):
+            keep_keys.add(key)
+
+    pruned_columns = [column for column in table.columns if column.key in keep_keys]
+    pruned_rows = [
+        EntityRow(
+            entity_id=row.entity_id,
+            cells={key: cell for key, cell in row.cells.items() if key in keep_keys},
+        )
+        for row in table.rows
+    ]
+    return StructuredEntityTable(
+        query=table.query,
+        title=table.title,
+        columns=pruned_columns,
+        rows=pruned_rows,
+        sources=list(table.sources),
+    )
+
+
+def _merge_batch_table(
+    *,
+    current_table: StructuredEntityTable,
+    batch_table: StructuredEntityTable,
+    source_registry: dict[str, dict[str, str | None]],
+) -> StructuredEntityTable:
+    if not current_table.rows:
+        return batch_table
+    return merge_tables(
+        base=current_table,
+        incoming=batch_table,
+        source_registry=source_registry,
+    )
+
+
+def _chunk_records(
+    records: list[dict[str, object]],
+    *,
+    chunk_size: int,
+) -> list[list[dict[str, object]]]:
+    size = max(1, chunk_size)
+    return [records[index : index + size] for index in range(0, len(records), size)]
+
+
+def _extract_table_from_chunks(
+    *,
+    query: str,
+    plan: ResearchPlan,
+    fetched_records: list[dict[str, object]],
+    source_registry: dict[str, dict[str, str | None]],
+    allow_partial: bool,
+    required_only: bool,
+    chunk_size: int,
+    progress_callback: Callable[[str], None] | None = None,
+    progress_label: str | None = None,
+) -> StructuredEntityTable:
+    chunked_records = _chunk_records(fetched_records, chunk_size=chunk_size)
+    if not chunked_records:
+        return _empty_table(query)
+
+    merged_table = _empty_table(query)
+    total_chunks = len(chunked_records)
+
+    for chunk_index, chunk in enumerate(chunked_records, start=1):
+        if progress_callback is not None and progress_label is not None and total_chunks > 1:
+            progress_callback(f"{progress_label} ({chunk_index}/{total_chunks})")
+        chunk_table = extract_table_from_frontier(
+            query=query,
+            plan=plan,
+            fetched_records=chunk,
+            source_registry=source_registry,
+            allow_partial=allow_partial,
+            required_only=required_only,
+        )
+        merged_table = _merge_batch_table(
+            current_table=merged_table,
+            batch_table=chunk_table,
+            source_registry=source_registry,
+        )
+
+    return merged_table
+
+
+def _update_frontier_selection(
+    *,
+    state: FrontierState,
+    frontier_candidates: list[SearchCandidate],
+) -> None:
+    selected_urls = {candidate.url for candidate in frontier_candidates}
+    for url in selected_urls:
+        if url not in state.selected_frontier_urls:
+            state.selected_frontier_urls.append(url)
+    state.remaining_candidates = [
+        candidate
+        for candidate in state.remaining_candidates
+        if candidate.url not in selected_urls
+    ]
+
+
+def _is_forbidden_fetch_error(error: object) -> bool:
+    message = str(error or "").lower()
+    return "403" in message or "forbidden" in message
+
+
+def _all_forbidden_fetch_failures(
+    *,
+    frontier_candidates: list[SearchCandidate],
+    batch_records: list[dict[str, object]],
+    batch_failed_fetches: list[dict[str, object]],
+) -> bool:
+    return (
+        not batch_records
+        and len(batch_failed_fetches) == len(frontier_candidates)
+        and bool(frontier_candidates)
+        and all(_is_forbidden_fetch_error(item.get("error")) for item in batch_failed_fetches)
+    )
+
+
+def _run_frontier_batches(
+    *,
+    query: str,
+    plan: ResearchPlan,
+    budgets: PipelineBudgets,
+    state: FrontierState,
+    fetch_tool: FetchURLTool,
+    progress_callback: Callable[[str], None],
+    extraction_chunk_size: int,
+) -> None:
+    for batch_index in range(1, budgets.max_frontier_batches + 1):
+        state.frontier_batch_count = batch_index
+        while state.remaining_candidates:
+            frontier_candidates = select_frontier_candidates(
+                candidates=state.remaining_candidates,
+                frontier_size=budgets.frontier_size,
             )
+            if not frontier_candidates:
+                return
 
-        agent = VertexInformationAgent(
-            model=get_model_name(),
-            system_prompt=get_information_agent_system_prompt(),
-            project=project,
-            location=get_vertex_location(),
-            http_options=types.HttpOptions(
-                api_version="v1",
-                retry_options=types.HttpRetryOptions(attempts=1),
-            ),
-        )
-    else:
-        api_key = get_api_key()
-        if not api_key:
-            raise ValueError(
-                "Set OPENAI_API_KEY or PROVIDER_API_KEY, or set "
-                "GOOGLE_GENAI_USE_VERTEXAI=True with GOOGLE_CLOUD_PROJECT."
+            _update_frontier_selection(state=state, frontier_candidates=frontier_candidates)
+
+            progress_callback(
+                f"Fetching frontier batch {batch_index} ({len(frontier_candidates)} page(s))"
             )
+            state.frontier_fetch_call_count += 1
+            batch_records, batch_failed_fetches = fetch_frontier_records(
+                frontier_candidates=frontier_candidates,
+                fetch_tool=fetch_tool,
+                focus_query=query,
+                source_registry=state.source_registry,
+                url_to_source_id=state.url_to_source_id,
+                full_document=True,
+            )
+            state.fetched_records.extend(batch_records)
+            state.failed_fetches.extend(batch_failed_fetches)
 
-        openai_client = OpenAI(
-            api_key=api_key,
-            base_url=get_base_url(),
-            max_retries=0,
-        )
-        client = instructor.from_openai(openai_client, mode=instructor.Mode.JSON)
+            if _all_forbidden_fetch_failures(
+                frontier_candidates=frontier_candidates,
+                batch_records=batch_records,
+                batch_failed_fetches=batch_failed_fetches,
+            ):
+                if state.remaining_candidates:
+                    progress_callback(
+                        "All selected frontier pages were forbidden; trying the next candidates"
+                    )
+                    continue
+                return
 
-        agent = AtomicAgent[InformationAgentInput, AgentAction](
-            config=AgentConfig(
-                client=client,
-                model=get_model_name(),
-                history=ChatHistory(),
-                system_prompt_generator=SystemPromptGenerator(
-                    background=[get_information_agent_system_prompt()]
-                ),
-            )  # type: ignore[arg-type]
-        )
+            if not batch_records:
+                break
 
-        def _on_completion_response(response) -> None:
-            usage = getattr(response, "usage", None)
-            if usage:
-                logger.debug(
-                    "tokens - prompt=%d, completion=%d, total=%d",
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens,
-                )
+            progress_callback(f"Extracting slot-driven table from batch {batch_index}")
+            batch_table = _extract_table_from_chunks(
+                query=query,
+                plan=plan,
+                fetched_records=batch_records,
+                source_registry=state.source_registry,
+                allow_partial=True,
+                required_only=False,
+                chunk_size=extraction_chunk_size,
+                progress_callback=progress_callback,
+                progress_label=f"Extracting slot-driven table from batch {batch_index}",
+            )
+            state.working_table = _merge_batch_table(
+                current_table=state.working_table,
+                batch_table=batch_table,
+                source_registry=state.source_registry,
+            )
+            break
 
-        agent.register_hook("completion:response", _on_completion_response)
 
-    tools = create_information_tools(deep_research=deep_research)
-
-    return agent, tools
+def _build_result_meta(
+    *,
+    budgets: PipelineBudgets,
+    deep_research: bool,
+    completion_mode: str,
+    research_plan: ResearchPlan,
+    initial_queries: list[str],
+    combined_query_history: list[dict[str, object]],
+    total_results: int,
+    retrieved_candidate_count: int,
+    ranked_candidates: list[SearchCandidate],
+    state: FrontierState,
+    complete_table: StructuredEntityTable,
+    recursive_research_meta: dict[str, object],
+    execution_time_ms: int,
+) -> dict[str, object]:
+    fetch_calls = state.frontier_fetch_call_count + int(recursive_research_meta.get("fetch_calls", 0))
+    return {
+        "mode": budgets.mode,
+        "deep_research": deep_research,
+        "recursive_research": recursive_research_meta,
+        "research_plan": research_plan.model_dump(),
+        "initial_queries": initial_queries,
+        "queries_run": combined_query_history,
+        "total_results": total_results,
+        "candidate_counts": {
+            "retrieved": retrieved_candidate_count,
+            "ranked": len(ranked_candidates),
+            "frontier": len(state.selected_frontier_urls),
+            "fetched": len(state.fetched_records),
+        },
+        "frontier_urls": state.selected_frontier_urls,
+        "frontier_batches": state.frontier_batch_count,
+        "failed_fetches": state.failed_fetches,
+        "fetch_calls": fetch_calls,
+        "fetch_limit": budgets.frontier_size,
+        "rows_with_required_slots": len(complete_table.rows),
+        "completion_mode": completion_mode,
+        "execution_time_ms": execution_time_ms,
+        "model": get_model_name(),
+    }
 
 
 def run_information_agent(
@@ -144,310 +454,145 @@ def run_information_agent(
     recursive_research: bool = False,
     lightning: bool = False,
     progress_callback: Callable[[str], None] | None = None,
+    detail_callback: Callable[[str], None] | None = None,
 ) -> str:
-    """Run the agentic entity-discovery loop and return a JSON string."""
+    """Run the tiered slot-driven research pipeline and return a JSON string."""
+
     progress_callback = progress_callback or (lambda _message: None)
-    if lightning:
-        progress_callback("Initializing lightning mode")
-        tools = create_information_tools(lightning=True)
-        result = run_lightning_research(
-            information_request=information_request,
-            search_tool=tools["search_tool"],
-            fetch_tool=tools["fetch_url_tool"],
-            write_tool=tools["write_file_tool"],
-            progress_callback=progress_callback,
-        )
-        progress_callback("Completed")
-        return result.model_dump_json(indent=2)
-
+    detail_callback = detail_callback or (lambda _message: None)
     start_time = time.perf_counter()
-    progress_callback("Initializing agent")
-    agent, tools = create_information_agent(deep_research=deep_research)
 
-    intent_tool = tools["intent_tool"]
-    search_tool = tools["search_tool"]
-    fetch_tool = tools["fetch_url_tool"]
-    write_tool = tools["write_file_tool"]
+    mode = _mode_name(deep_research=deep_research, lightning=lightning)
+    progress_callback(f"Initializing {mode} pipeline")
+    tools = create_information_tools(deep_research=deep_research, lightning=lightning)
+    planner_tool: ResearchPlannerTool = tools["planner_tool"]  # type: ignore[assignment]
+    search_tool: SearchTool = tools["search_tool"]  # type: ignore[assignment]
+    fetch_tool: FetchURLTool = tools["fetch_url_tool"]  # type: ignore[assignment]
+    write_tool: WriteToFileTool = tools["write_file_tool"]  # type: ignore[assignment]
 
-    fetch_limit = get_fetch_limit(deep_research)
-    loop_limit = get_loop_limit(deep_research)
-    fetch_count = 0
-    queries_run: list[dict[str, object]] = []
-    total_results = 0
-    json_file_path = ""
-    markdown_file_path = ""
-    final_table: StructuredEntityTable | None = None
-    recursive_research_meta: dict[str, object] = {"enabled": recursive_research}
-    progress_callback("Decomposing intent")
-    intent_decomposition: IntentDecomposition = intent_tool.run(
-        IntentClassificationInput(
+    progress_callback("Building research plan")
+    research_plan = planner_tool.run(
+        ResearchPlannerInput(
             user_request=information_request,
             deep_research=deep_research,
+            lightning=lightning,
         )
     )
-
-    source_registry: dict[str, dict[str, str | None]] = {}
-    url_to_source_id: dict[str, str] = {}
-
-    logger.info("starting entity discovery for topic query")
-    logger.info(
-        "intent decomposition ready: depth=%s, search_requests=%d",
-        intent_decomposition.research_depth,
-        len(intent_decomposition.search_requests),
+    detail_callback(format_research_plan(research_plan))
+    budgets = _build_pipeline_budgets(
+        plan=research_plan,
+        deep_research=deep_research,
+        lightning=lightning,
+    )
+    extraction_chunk_size = _extraction_chunk_size(
+        deep_research=deep_research,
+        lightning=lightning,
     )
 
-    progress_callback("Planning research")
-    action: AgentAction = agent.run(
-        InformationAgentInput(
-            information_request=information_request,
-            deep_research=deep_research,
-            recursive_research=recursive_research,
-            intent_decomposition=intent_decomposition,
-        )
+    initial_queries = build_initial_search_queries(
+        research_plan,
+        max_queries=budgets.initial_query_budget,
     )
 
-    for iteration in range(1, loop_limit + 1):
-        logger.info(
-            "[iter %d] agent -> %s | %s",
-            iteration,
-            action.action_type,
-            action.reasoning,
+    progress_callback("Retrieving candidate pages")
+    candidates, queries_run, total_results = run_candidate_search(
+        search_tool=search_tool,
+        queries=initial_queries,
+    )
+
+    progress_callback("Reranking candidate pages")
+    ranked_candidates = apply_semantic_rerank(
+        candidates=candidates,
+        plan=research_plan,
+    )
+
+    state = FrontierState(
+        working_table=_empty_table(information_request),
+        remaining_candidates=list(ranked_candidates),
+    )
+
+    _run_frontier_batches(
+        query=information_request,
+        plan=research_plan,
+        budgets=budgets,
+        state=state,
+        fetch_tool=fetch_tool,
+        progress_callback=progress_callback,
+        extraction_chunk_size=extraction_chunk_size,
+    )
+    recursive_research_meta: dict[str, object] = {
+        "enabled": recursive_research,
+        "queries_run": [],
+        "fetch_calls": 0,
+    }
+    if recursive_research and state.working_table.rows:
+        progress_callback("Backfilling missing cells")
+        state.working_table, recursive_research_meta = run_recursive_research(
+            result=state.working_table,
+            original_query=information_request,
+            research_plan=research_plan,
+            source_registry=state.source_registry,
+            url_to_source_id=state.url_to_source_id,
+            progress_callback=progress_callback,
+            include_optional_slots=False,
         )
 
-        if action.action_type == "search_web":
-            query = (action.search_query or "").strip()
-            if not query:
-                tool_result_str = json.dumps(
-                    {"error": "search_query was empty"}, ensure_ascii=False
-                )
-            else:
-                progress_callback(f"Searching web (iteration {iteration})")
-                logger.info("  search_web: querying %r", query)
-                output = search_tool.run(SearchToolInput(value=query))
-
-                if output.error:
-                    queries_run.append(
-                        {
-                            "query": query,
-                            "results": 0,
-                            "error": output.error,
-                        }
-                    )
-                    tool_result_str = json.dumps(
-                        {
-                            "query": query,
-                            "results": [],
-                            "error": output.error,
-                        },
-                        ensure_ascii=False,
-                    )
-                    logger.warning("  search_web failed: %s", output.error)
-                    agent.history.add_message(
-                        "user",
-                        ToolResult(tool_name=action.action_type, result=tool_result_str),
-                    )
-                    progress_callback(f"Thinking about next step (iteration {iteration})")
-                    action = agent.run()
-                    continue
-
-                enriched_results: list[dict[str, object]] = []
-                for item in output.results:
-                    url = compact_text(str(item.get("href") or item.get("url") or ""))
-                    title = compact_text(str(item.get("title") or ""))
-                    snippet = compact_text(
-                        str(item.get("body") or item.get("snippet") or "")
-                    )
-                    if not url or not title:
-                        continue
-
-                    source_id = url_to_source_id.get(url)
-                    if not source_id:
-                        source_id = f"src_{len(url_to_source_id) + 1:03d}"
-                        url_to_source_id[url] = source_id
-
-                    source_registry[source_id] = {
-                        "source_id": source_id,
-                        "title": title,
-                        "url": url,
-                        "snippet": snippet,
-                    }
-                    enriched_results.append(
-                        {
-                            "source_id": source_id,
-                            "title": title,
-                            "href": url,
-                            "body": snippet or "",
-                        }
-                    )
-
-                queries_run.append({"query": query, "results": len(enriched_results)})
-                total_results += len(enriched_results)
-                tool_result_str = json.dumps(enriched_results, ensure_ascii=False)
-
-        elif action.action_type == "fetch_url":
-            if fetch_count >= fetch_limit:
-                tool_result_str = json.dumps(
-                    {
-                        "error": (
-                            f"fetch_url limit reached ({fetch_limit} calls). "
-                            "Use the fetched evidence you already have and finish."
-                        )
-                    },
-                    ensure_ascii=False,
-                )
-            else:
-                urls = [url.strip() for url in (action.urls_to_fetch or []) if url.strip()]
-                deduped_urls = list(dict.fromkeys(urls))
-                if not deduped_urls:
-                    tool_result_str = json.dumps(
-                        {"error": "urls_to_fetch was empty"}, ensure_ascii=False
-                    )
-                else:
-                    fetch_count += 1
-                    progress_callback(
-                        f"Fetching {len(deduped_urls)} page(s) ({fetch_count}/{fetch_limit})"
-                    )
-                    logger.info(
-                        "  fetch_url: fetching %d URL(s) [call %d/%d]",
-                        len(deduped_urls),
-                        fetch_count,
-                        fetch_limit,
-                    )
-                    output = fetch_tool.run(FetchURLToolInputSchema(value=deduped_urls))
-
-                    fetched_records: list[dict[str, object]] = []
-                    failed_fetches: list[dict[str, object]] = []
-                    for url, content in zip(deduped_urls, output.result):
-                        source_id = url_to_source_id.get(url)
-                        if not source_id:
-                            source_id = f"src_{len(url_to_source_id) + 1:03d}"
-                            url_to_source_id[url] = source_id
-                            source_registry[source_id] = {
-                                "source_id": source_id,
-                                "title": url,
-                                "url": url,
-                                "snippet": None,
-                            }
-
-                        metadata = source_registry[source_id]
-                        if fetch_tool.is_error_result(content):
-                            failed_fetches.append(
-                                {
-                                    "source_id": source_id,
-                                    "title": metadata.get("title") or url,
-                                    "url": url,
-                                    "snippet": metadata.get("snippet"),
-                                    "error": content,
-                                }
-                            )
-                            continue
-
-                        fetched_records.append(
-                            {
-                                "source_id": source_id,
-                                "title": metadata.get("title") or url,
-                                "url": url,
-                                "snippet": metadata.get("snippet"),
-                                "content": truncate_content(content),
-                            }
-                        )
-
-                    tool_result_str = json.dumps(
-                        {
-                            "fetched_records": fetched_records,
-                            "failed_fetches": failed_fetches,
-                        },
-                        ensure_ascii=False,
-                    )
-
-        elif action.action_type == "finish":
-            if action.final_result is None:
-                raise ValueError("Agent returned finish without final_result.")
-
-            progress_callback("Normalizing results")
-            final_table = normalize_result(
-                action.final_result,
-                query=information_request,
-                source_registry=source_registry,
-                require_complete=not recursive_research,
-            )
-            if recursive_research:
-                progress_callback("Running recursive research")
-                final_table, recursive_research_meta = run_recursive_research(
-                    result=final_table,
-                    original_query=information_request,
-                    deep_research=deep_research,
-                    search_tool=search_tool,
-                    fetch_tool=fetch_tool,
-                    source_registry=source_registry,
-                    url_to_source_id=url_to_source_id,
-                    progress_callback=progress_callback,
-                )
-            progress_callback("Writing output files")
-            json_payload = final_table.model_dump_json(indent=2)
-            markdown_payload = render_markdown_document(final_table)
-
-            json_write = write_tool.run(
-                WriteToFileToolInputSchema(
-                    path=str(JSON_OUTPUT_PATH),
-                    content=json_payload,
-                )
-            )
-            markdown_write = write_tool.run(
-                WriteToFileToolInputSchema(
-                    path=str(MARKDOWN_OUTPUT_PATH),
-                    content=markdown_payload,
-                )
-            )
-            json_file_path = json_write.absolute_path
-            markdown_file_path = markdown_write.absolute_path
-            logger.info("  finish: wrote JSON -> %s", json_file_path)
-            logger.info("  finish: wrote markdown -> %s", markdown_file_path)
-            break
-
-        else:
-            raise ValueError(f"Unknown action_type: {action.action_type}")
-
-        agent.history.add_message(
-            "user",
-            ToolResult(tool_name=action.action_type, result=tool_result_str),
-        )
-        progress_callback(f"Thinking about next step (iteration {iteration})")
-        action = agent.run()
+    complete_table, partial_table = _finalize_table(
+        table=state.working_table,
+        query=information_request,
+        plan=research_plan,
+        source_registry=state.source_registry,
+    )
+    if complete_table.rows:
+        final_table = _prune_incomplete_columns(complete_table)
+        completion_mode = "required_slots_complete"
+    elif partial_table.rows:
+        final_table = _prune_incomplete_columns(partial_table)
+        completion_mode = "partial_rows_returned"
     else:
-        logger.warning(
-            "agent loop exhausted (%d iterations) without finishing",
-            loop_limit,
-        )
+        final_table = _empty_table(information_request)
+        completion_mode = "empty"
 
+    progress_callback("Writing output files")
+    json_payload = final_table.model_dump_json(indent=2)
+    markdown_payload = render_markdown_document(final_table)
+    json_write = write_tool.run(
+        WriteToFileToolInputSchema(path=str(JSON_OUTPUT_PATH), content=json_payload)
+    )
+    markdown_write = write_tool.run(
+        WriteToFileToolInputSchema(
+            path=str(MARKDOWN_OUTPUT_PATH),
+            content=markdown_payload,
+        )
+    )
+
+    combined_query_history = _flatten_query_history(
+        queries_run,
+        recursive_research_meta,
+    )
     execution_time_ms = int((time.perf_counter() - start_time) * 1000)
-    status = "success" if final_table and json_file_path and markdown_file_path else "error"
-
-    if final_table is None:
-        final_table = StructuredEntityTable(
-            query=information_request,
-            title=f"Discovered entities for {information_request}",
-            columns=[],
-            rows=[],
-            sources=[],
-        )
+    status = "success" if final_table.rows or state.fetched_records else "error"
 
     result = InformationAgentOutput(
         status=status,
-        json_file_path=json_file_path,
-        markdown_file_path=markdown_file_path,
+        json_file_path=json_write.absolute_path,
+        markdown_file_path=markdown_write.absolute_path,
         result=final_table,
-        meta={
-            "deep_research": deep_research,
-            "recursive_research": recursive_research_meta,
-            "intent_decomposition": intent_decomposition.model_dump(),
-            "queries_run": queries_run,
-            "total_results": total_results,
-            "fetch_calls": fetch_count,
-            "fetch_limit": fetch_limit,
-            "execution_time_ms": execution_time_ms,
-            "model": get_model_name(),
-        },
+        meta=_build_result_meta(
+            budgets=budgets,
+            deep_research=deep_research,
+            completion_mode=completion_mode,
+            research_plan=research_plan,
+            initial_queries=initial_queries,
+            combined_query_history=combined_query_history,
+            total_results=total_results,
+            retrieved_candidate_count=len(candidates),
+            ranked_candidates=ranked_candidates,
+            state=state,
+            complete_table=complete_table,
+            recursive_research_meta=recursive_research_meta,
+            execution_time_ms=execution_time_ms,
+        ),
     )
     progress_callback("Completed")
     return result.model_dump_json(indent=2)
@@ -485,24 +630,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--recursive-research",
         action="store_true",
-        help=(
-            "Run a targeted follow-up search pass that backfills missing "
-            "attribute/value pairs into the original table"
-        ),
+        help="Expand nice-to-have slots after required slots are filled",
     )
     parser.add_argument(
         "--lightning",
         action="store_true",
-        help=(
-            "Run a speed-optimized pass that uses one compact search/fetch/extract "
-            "cycle and aims to finish in under 10 seconds"
-        ),
+        help="Run a speed-optimized version of the slot-driven pipeline",
     )
     args = parser.parse_args()
-    if args.lightning and args.deep_research is True:
-        parser.error("--lightning cannot be combined with --deep-research")
-    if args.lightning and args.recursive_research:
-        parser.error("--lightning cannot be combined with --recursive-research")
 
     with CliProgressReporter() as progress:
         result = run_information_agent(
@@ -515,6 +650,8 @@ if __name__ == "__main__":
             recursive_research=(False if args.lightning else args.recursive_research),
             lightning=args.lightning,
             progress_callback=progress.update,
+            detail_callback=progress.log,
         )
         progress.complete("Completed")
+
     print(result)

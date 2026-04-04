@@ -11,6 +11,7 @@ def normalize_result(
     query: str,
     source_registry: dict[str, dict[str, str | None]],
     require_complete: bool = True,
+    required_column_keys: set[str] | None = None,
 ) -> StructuredEntityTable:
     normalized_columns: list[TableColumn] = []
     seen_column_keys: set[str] = set()
@@ -90,11 +91,14 @@ def normalize_result(
         if not name_cell or not name_cell.value or not name_cell.citations:
             continue
 
+        required_keys = required_column_keys or {
+            column.key for column in normalized_columns
+        }
         if require_complete and any(
-            column.key not in cleaned_cells
-            or not cleaned_cells[column.key].value
-            or not cleaned_cells[column.key].citations
-            for column in normalized_columns
+            key not in cleaned_cells
+            or not cleaned_cells[key].value
+            or not cleaned_cells[key].citations
+            for key in required_keys
         ):
             dropped_incomplete_rows += 1
             continue

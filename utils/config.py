@@ -39,6 +39,17 @@ class FetchSettings(BaseModel):
 
     max_workers: int = 6
     timeout_seconds: int = 30
+    cache_dir: str = ".cache/fetch_url"
+    cache_ttl_seconds: int = 86400
+    retrieval_passage_limit: int = 5
+    retrieval_neighbor_radius: int = 1
+
+
+class VertexCacheSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    dir: str = ".cache/vertex_cache"
+    ttl_seconds: int = 3600
 
 
 class StandardModeSettings(BaseModel):
@@ -46,28 +57,22 @@ class StandardModeSettings(BaseModel):
 
     search_result_limit: int = 8
     fetch_limit: int = 6
-    loop_limit: int = 16
 
 
 class DeepModeSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     search_result_limit: int = 12
-    fetch_limit: int = 12
-    loop_limit: int = 24
+    fetch_limit: int = 3
 
 
 class LightningModeSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    deadline_seconds: float = 9.5
     max_search_queries: int = 3
     search_result_limit: int = 5
     search_timeout_seconds: int = 3
     fetch_url_limit: int = 3
-    max_content_chars: int = 3500
-    request_timeout_seconds: float = 4.5
-    result_row_limit: int = 5
 
 
 class ModeSettings(BaseModel):
@@ -93,7 +98,6 @@ class ModelSettings(BaseModel):
     openai_default: str = "gpt-4.1-mini"
     vertex_default: str = "gemini-2.5-flash"
     intent: str | None = None
-    lightning: str | None = None
 
 
 class Settings(BaseModel):
@@ -103,6 +107,7 @@ class Settings(BaseModel):
     content: ContentSettings = Field(default_factory=ContentSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     fetch: FetchSettings = Field(default_factory=FetchSettings)
+    vertex_cache: VertexCacheSettings = Field(default_factory=VertexCacheSettings)
     models: ModelSettings = Field(default_factory=ModelSettings)
     modes: ModeSettings = Field(default_factory=ModeSettings)
     recursive_research: RecursiveResearchSettings = Field(
@@ -124,13 +129,6 @@ def _env_int(name: str) -> int | None:
     return int(value)
 
 
-def _env_float(name: str) -> float | None:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return None
-    return float(value)
-
-
 def _set_if_not_none(target: dict[str, Any], key: str, value: Any) -> None:
     if value is not None:
         target[key] = value
@@ -148,6 +146,7 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
     output = dict(raw.get("output") or {})
     search = dict(raw.get("search") or {})
     fetch = dict(raw.get("fetch") or {})
+    vertex_cache = dict(raw.get("vertex_cache") or {})
     models = dict(raw.get("models") or {})
     content = dict(raw.get("content") or {})
     modes = dict(raw.get("modes") or {})
@@ -167,27 +166,40 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
 
     _set_if_not_none(fetch, "max_workers", _env_int("FETCH_URL_MAX_WORKERS"))
     _set_if_not_none(fetch, "timeout_seconds", _env_int("FETCH_TIMEOUT_SECONDS"))
+    _set_if_not_none(fetch, "cache_dir", os.getenv("FETCH_CACHE_DIR"))
+    _set_if_not_none(fetch, "cache_ttl_seconds", _env_int("FETCH_CACHE_TTL_SECONDS"))
+    _set_if_not_none(
+        fetch,
+        "retrieval_passage_limit",
+        _env_int("FETCH_RETRIEVAL_PASSAGE_LIMIT"),
+    )
+    _set_if_not_none(
+        fetch,
+        "retrieval_neighbor_radius",
+        _env_int("FETCH_RETRIEVAL_NEIGHBOR_RADIUS"),
+    )
+
+    _set_if_not_none(vertex_cache, "dir", os.getenv("VERTEX_CACHE_DIR"))
+    _set_if_not_none(
+        vertex_cache,
+        "ttl_seconds",
+        _env_int("VERTEX_CACHE_TTL_SECONDS"),
+    )
 
     _set_if_not_none(models, "openai_default", os.getenv("DEFAULT_OPENAI_MODEL"))
     _set_if_not_none(models, "vertex_default", os.getenv("DEFAULT_VERTEX_MODEL"))
     _set_if_not_none(models, "intent", os.getenv("DEFAULT_INTENT_MODEL"))
-    _set_if_not_none(models, "lightning", os.getenv("DEFAULT_LIGHTNING_MODEL"))
 
     _set_if_not_none(
         standard_mode, "search_result_limit", _env_int("STANDARD_SEARCH_RESULT_LIMIT")
     )
     _set_if_not_none(standard_mode, "fetch_limit", _env_int("STANDARD_FETCH_LIMIT"))
-    _set_if_not_none(standard_mode, "loop_limit", _env_int("STANDARD_LOOP_LIMIT"))
 
     _set_if_not_none(deep_mode, "search_result_limit", _env_int("DEEP_SEARCH_RESULT_LIMIT"))
     _set_if_not_none(deep_mode, "fetch_limit", _env_int("DEEP_FETCH_LIMIT"))
-    _set_if_not_none(deep_mode, "loop_limit", _env_int("DEEP_LOOP_LIMIT"))
 
     _set_if_not_none(
         lightning_mode, "max_search_queries", _env_int("LIGHTNING_MAX_SEARCH_QUERIES")
-    )
-    _set_if_not_none(
-        lightning_mode, "deadline_seconds", _env_float("LIGHTNING_DEADLINE_SECONDS")
     )
     _set_if_not_none(
         lightning_mode, "search_result_limit", _env_int("LIGHTNING_SEARCH_RESULT_LIMIT")
@@ -199,17 +211,6 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
     )
     _set_if_not_none(
         lightning_mode, "fetch_url_limit", _env_int("LIGHTNING_FETCH_URL_LIMIT")
-    )
-    _set_if_not_none(
-        lightning_mode, "max_content_chars", _env_int("LIGHTNING_MAX_CONTENT_CHARS")
-    )
-    _set_if_not_none(
-        lightning_mode,
-        "request_timeout_seconds",
-        _env_float("LIGHTNING_REQUEST_TIMEOUT_SECONDS"),
-    )
-    _set_if_not_none(
-        lightning_mode, "result_row_limit", _env_int("LIGHTNING_RESULT_ROW_LIMIT")
     )
 
     _set_if_not_none(
@@ -237,6 +238,7 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
         "content": content,
         "search": search,
         "fetch": fetch,
+        "vertex_cache": vertex_cache,
         "models": models,
         "modes": {
             **modes,
@@ -291,14 +293,6 @@ def get_intent_model_name() -> str:
     )
 
 
-def get_lightning_model_name() -> str:
-    return (
-        os.getenv("LIGHTNING_MODEL")
-        or get_settings().models.lightning
-        or get_model_name()
-    )
-
-
 def get_vertex_project() -> str:
     return os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
 
@@ -343,18 +337,42 @@ def get_fetch_limit(deep_research: bool) -> int:
     return get_settings().modes.standard.fetch_limit
 
 
-def get_loop_limit(deep_research: bool) -> int:
-    if deep_research:
-        return get_settings().modes.deep.loop_limit
-    return get_settings().modes.standard.loop_limit
-
-
 def get_fetch_url_max_workers() -> int:
     return get_settings().fetch.max_workers
 
 
 def get_fetch_timeout_seconds() -> int:
     return get_settings().fetch.timeout_seconds
+
+
+def get_fetch_cache_dir() -> Path:
+    configured_path = Path(get_settings().fetch.cache_dir)
+    if configured_path.is_absolute():
+        return configured_path
+    return PROJECT_ROOT / configured_path
+
+
+def get_fetch_cache_ttl_seconds() -> int:
+    return get_settings().fetch.cache_ttl_seconds
+
+
+def get_vertex_cache_dir() -> Path:
+    configured_path = Path(get_settings().vertex_cache.dir)
+    if configured_path.is_absolute():
+        return configured_path
+    return PROJECT_ROOT / configured_path
+
+
+def get_vertex_cache_ttl_seconds() -> int:
+    return get_settings().vertex_cache.ttl_seconds
+
+
+def get_fetch_retrieval_passage_limit() -> int:
+    return get_settings().fetch.retrieval_passage_limit
+
+
+def get_fetch_retrieval_neighbor_radius() -> int:
+    return get_settings().fetch.retrieval_neighbor_radius
 
 
 def get_recursive_research_max_rounds() -> int:
@@ -371,28 +389,12 @@ def get_recursive_search_result_limit(deep_research: bool) -> int:
     return get_settings().recursive_research.standard_search_result_limit
 
 
-def get_lightning_deadline_seconds() -> float:
-    return get_settings().modes.lightning.deadline_seconds
-
-
 def get_lightning_max_search_queries() -> int:
     return get_settings().modes.lightning.max_search_queries
 
 
 def get_lightning_fetch_url_limit() -> int:
     return get_settings().modes.lightning.fetch_url_limit
-
-
-def get_lightning_max_content_chars() -> int:
-    return get_settings().modes.lightning.max_content_chars
-
-
-def get_lightning_request_timeout_seconds() -> float:
-    return get_settings().modes.lightning.request_timeout_seconds
-
-
-def get_lightning_result_row_limit() -> int:
-    return get_settings().modes.lightning.result_row_limit
 
 
 def get_lightning_search_timeout_seconds() -> int:
@@ -409,3 +411,4 @@ RECURSIVE_RESEARCH_MAX_FETCH_URLS = get_recursive_research_max_fetch_urls()
 OUTPUT_DIR = get_output_dir()
 JSON_OUTPUT_PATH = get_json_output_path()
 MARKDOWN_OUTPUT_PATH = get_markdown_output_path()
+FETCH_CACHE_DIR = get_fetch_cache_dir()

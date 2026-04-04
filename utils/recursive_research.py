@@ -1,307 +1,386 @@
+from __future__ import annotations
+
 import json
-import logging
 from typing import Any, Callable
 
-from schema import EntityRow, RecursiveResearchFill, SourceCitation, StructuredEntityTable, TableCell, TableColumn
-from tools.fetch_url import FetchURLTool, FetchURLToolInputSchema
-from tools.web_search_tool import SearchTool, SearchToolInput
-from utils.config import (
-    get_recursive_research_max_fetch_urls,
-    get_recursive_research_max_rounds,
-    get_recursive_search_result_limit,
+from atomic_agents import BaseIOSchema
+from pydantic import Field
+
+from schema import (
+    EntityRow,
+    ResearchPlan,
+    ResearchSlot,
+    SourceCitation,
+    StructuredEntityTable,
+    TableCell,
 )
 from utils.llm_utils import run_structured_generation
 from utils.result_utils import collect_sources_from_rows
-from utils.text_utils import compact_text, normalize_key, truncate_content
+from utils.text_utils import compact_text, normalize_key
 
-logger = logging.getLogger(__name__)
-
-
-def get_missing_columns(row: EntityRow, columns: list[TableColumn]) -> list[TableColumn]:
-    return [
-        column
-        for column in columns
-        if column.key not in row.cells
-        or not row.cells[column.key].value
-        or not row.cells[column.key].citations
-    ]
+RECURSIVE_BACKFILL_MODEL_NAME ="gemini-3.1-pro-preview"
+RECURSIVE_BACKFILL_BATCH_SIZE = 5
+RECURSIVE_BACKFILL_MAX_BATCHES = 1
 
 
-def build_recursive_query(
-    entity_name: str,
-    missing_columns: list[TableColumn],
-    base_query: str,
-    round_index: int,
-) -> str:
-    special_terms = {
-        "website": "official website site about",
-        "location": "location headquarters address about",
-        "summary": "overview profile about",
-        "category": "type category what it is",
-    }
+class GroundedBackfillCitation(BaseIOSchema):
+    """One grounded citation returned by the batched recursive backfill step."""
 
-    query_terms: list[str] = []
-    for column in missing_columns:
-        query_terms.append(column.label)
-        if column.key in special_terms:
-            query_terms.append(special_terms[column.key])
-
-    deduped_terms = list(dict.fromkeys(term for term in query_terms if term))
-    if round_index == 1:
-        return f"\"{entity_name}\" {base_query} {' '.join(deduped_terms[:4])}".strip()
-
-    return f"\"{entity_name}\" {' '.join(deduped_terms)} official about details".strip()
+    source_title: str | None = Field(default=None)
+    source_url: str | None = Field(default=None)
+    quote: str | None = Field(default=None)
 
 
-def merge_recursive_fill(
+class GroundedBackfillCell(BaseIOSchema):
+    """One requested cell fill returned by the batched recursive backfill step."""
+
+    slot_key: str = Field(..., description="Missing slot key to fill")
+    value: str | None = Field(default=None, description="Grounded value for the slot")
+    citations: list[GroundedBackfillCitation] = Field(default_factory=list)
+
+
+class GroundedBackfillRow(BaseIOSchema):
+    """Batched cell fills for one existing table row."""
+
+    entity_id: str = Field(..., description="Existing row identifier")
+    fills: list[GroundedBackfillCell] = Field(default_factory=list)
+
+
+class GroundedBackfillBatch(BaseIOSchema):
+    """Batched grounded answers for the table's missing cells."""
+
+    rows: list[GroundedBackfillRow] = Field(default_factory=list)
+
+
+def _chunk_rows(
+    rows: list[dict[str, object]],
+    *,
+    chunk_size: int,
+) -> list[list[dict[str, object]]]:
+    size = max(1, chunk_size)
+    return [rows[index : index + size] for index in range(0, len(rows), size)]
+
+
+def _row_has_missing_target_slot(
     row: EntityRow,
-    fill: RecursiveResearchFill,
-    allowed_columns: list[TableColumn],
-    source_registry: dict[str, dict[str, str | None]],
-) -> int:
-    allowed_keys = {column.key for column in allowed_columns}
-    filled_count = 0
+    *,
+    target_slots: list[ResearchSlot],
+) -> bool:
+    return any(_is_slot_missing(row, slot) for slot in target_slots)
 
-    for candidate in fill.filled_cells:
-        key = normalize_key(candidate.key)
-        if key not in allowed_keys:
+
+def _is_slot_missing(row: EntityRow, slot: ResearchSlot) -> bool:
+    key = normalize_key(slot.key or slot.label)
+    if key == "name":
+        return False
+    cell = row.cells.get(key)
+    return not cell or not compact_text(cell.value) or not cell.citations
+
+
+def _target_slots(
+    research_plan: ResearchPlan,
+    *,
+    include_optional_slots: bool,
+) -> list[ResearchSlot]:
+    slots = list(research_plan.required_slots)
+    if include_optional_slots:
+        slots.extend(research_plan.nice_to_have_slots)
+    return slots
+
+
+def _row_name(row: EntityRow) -> str:
+    return compact_text(
+        (row.cells.get("name").value if row.cells.get("name") else None) or row.entity_id
+    )
+
+
+def _known_row_context(row: EntityRow) -> dict[str, str]:
+    context: dict[str, str] = {}
+    for key, cell in row.cells.items():
+        value = compact_text(cell.value)
+        if value:
+            context[key] = value
+    return context
+
+
+def _missing_row_requests(
+    *,
+    result: StructuredEntityTable,
+    target_slots: list[ResearchSlot],
+) -> tuple[list[dict[str, object]], dict[str, set[str]]]:
+    requests: list[dict[str, object]] = []
+    missing_keys_by_row: dict[str, set[str]] = {}
+
+    for row in result.rows:
+        entity_name = _row_name(row)
+        if not entity_name:
             continue
-        if key in row.cells and row.cells[key].value and row.cells[key].citations:
-            continue
 
-        value = compact_text(candidate.value)
-        if not value:
-            continue
-
-        citations: list[SourceCitation] = []
-        for citation in candidate.citations:
-            source_id = compact_text(citation.source_id)
-            source_meta = source_registry.get(source_id or "", {})
-            source_title = compact_text(citation.source_title) or compact_text(
-                source_meta.get("title")
-            )
-            source_url = compact_text(citation.source_url) or compact_text(
-                source_meta.get("url")
-            )
-            quote = compact_text(citation.quote)
-
-            if not source_id or not source_title or not source_url or not quote:
+        missing_slots = []
+        for slot in target_slots:
+            if not _is_slot_missing(row, slot):
                 continue
-
-            citations.append(
-                SourceCitation(
-                    source_id=source_id,
-                    source_title=source_title,
-                    source_url=source_url,
-                    quote=quote,
-                )
+            missing_slots.append(
+                {
+                    "slot_key": normalize_key(slot.key or slot.label),
+                    "slot_label": slot.label,
+                    "description": slot.description,
+                }
             )
 
-        if not citations:
+        if not missing_slots:
             continue
 
-        row.cells[key] = TableCell(value=value, citations=citations)
-        filled_count += 1
+        requests.append(
+            {
+                "entity_id": row.entity_id,
+                "entity_name": entity_name,
+                "known_cells": _known_row_context(row),
+                "missing_slots": missing_slots,
+            }
+        )
+        missing_keys_by_row[row.entity_id] = {
+            str(slot["slot_key"]) for slot in missing_slots if slot.get("slot_key")
+        }
 
-    return filled_count
+    return requests, missing_keys_by_row
+
+
+def _register_citation(
+    *,
+    citation: GroundedBackfillCitation,
+    source_registry: dict[str, dict[str, str | None]],
+    url_to_source_id: dict[str, str],
+) -> SourceCitation | None:
+    source_url = compact_text(citation.source_url)
+    quote = compact_text(citation.quote)
+    source_title = compact_text(citation.source_title) or source_url
+    if not source_url or not quote:
+        return None
+
+    source_id = url_to_source_id.get(source_url)
+    if not source_id:
+        source_id = f"src_{len(url_to_source_id) + 1:03d}"
+        url_to_source_id[source_url] = source_id
+
+    source_registry[source_id] = {
+        "source_id": source_id,
+        "title": source_title,
+        "url": source_url,
+        "snippet": None,
+    }
+    return SourceCitation(
+        source_id=source_id,
+        source_title=source_title,
+        source_url=source_url,
+        quote=quote,
+    )
+
+
+def _build_table_cell(
+    *,
+    item: GroundedBackfillCell,
+    source_registry: dict[str, dict[str, str | None]],
+    url_to_source_id: dict[str, str],
+) -> TableCell | None:
+    value = compact_text(item.value)
+    if not value:
+        return None
+
+    citations: list[SourceCitation] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for citation in item.citations:
+        normalized = _register_citation(
+            citation=citation,
+            source_registry=source_registry,
+            url_to_source_id=url_to_source_id,
+        )
+        if normalized is None:
+            continue
+        pair = (normalized.source_id, normalized.quote)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        citations.append(normalized)
+
+    if not citations:
+        return None
+    return TableCell(value=value, citations=citations)
 
 
 def run_recursive_research(
     result: StructuredEntityTable,
     original_query: str,
-    deep_research: bool,
-    search_tool: SearchTool,
-    fetch_tool: FetchURLTool,
+    research_plan: ResearchPlan,
     source_registry: dict[str, dict[str, str | None]],
     url_to_source_id: dict[str, str],
     progress_callback: Callable[[str], None] | None = None,
+    include_optional_slots: bool = False,
 ) -> tuple[StructuredEntityTable, dict[str, Any]]:
+    target_slots = _target_slots(
+        research_plan,
+        include_optional_slots=include_optional_slots,
+    )
+    row_requests, missing_keys_by_row = _missing_row_requests(
+        result=result,
+        target_slots=target_slots,
+    )
+    max_rows_to_fix = RECURSIVE_BACKFILL_BATCH_SIZE * RECURSIVE_BACKFILL_MAX_BATCHES
+    capped_row_requests = row_requests[:max_rows_to_fix]
+    skipped_row_requests = row_requests[max_rows_to_fix:]
     stats: dict[str, Any] = {
         "enabled": True,
-        "rows_considered": 0,
-        "queries_run": [],
+        "batched": True,
+        "batch_size": RECURSIVE_BACKFILL_BATCH_SIZE,
+        "max_batches": RECURSIVE_BACKFILL_MAX_BATCHES,
+        "rows_considered": len(capped_row_requests),
+        "rows_over_cap": len(skipped_row_requests),
+        "slots_considered": sum(len(keys) for keys in missing_keys_by_row.values()),
         "cells_filled": 0,
-        "rounds_attempted": 0,
+        "llm_calls": 0,
+        "queries_run": [],
+        "chunk_errors": [],
     }
-    max_rounds = get_recursive_research_max_rounds()
-    max_fetch_urls = get_recursive_research_max_fetch_urls()
-
-    for row in result.rows:
-        missing_columns = get_missing_columns(row, result.columns)
-        if not missing_columns:
-            continue
-
-        stats["rows_considered"] += 1
-        entity_name = row.cells["name"].value or row.entity_id
-
-        for round_index in range(1, max_rounds + 1):
-            missing_columns = get_missing_columns(row, result.columns)
-            if not missing_columns:
-                break
-
-            stats["rounds_attempted"] += 1
-            query = build_recursive_query(
-                entity_name=entity_name,
-                missing_columns=missing_columns,
-                base_query=original_query,
-                round_index=round_index,
-            )
-            if progress_callback is not None:
-                progress_callback(
-                    f"Recursive research for {entity_name} ({round_index}/{max_rounds})"
-                )
-            search_output = search_tool.run(SearchToolInput(value=query))
-            if search_output.error:
-                stats["queries_run"].append(
-                    {
-                        "entity_id": row.entity_id,
-                        "entity_name": entity_name,
-                        "round": round_index,
-                        "query": query,
-                        "missing_keys": [column.key for column in missing_columns],
-                        "search_results": 0,
-                        "error": search_output.error,
-                    }
-                )
-                logger.warning(
-                    "recursive search failed for %s on round %d: %s",
-                    entity_name,
-                    round_index,
-                    search_output.error,
-                )
-                continue
-            selected_results = search_output.results[
-                : get_recursive_search_result_limit(deep_research)
+    if not capped_row_requests:
+        if skipped_row_requests:
+            skipped_ids = {
+                compact_text(row_request.get("entity_id"))
+                for row_request in skipped_row_requests
+            }
+            result.rows = [
+                row for row in result.rows if compact_text(row.entity_id) not in skipped_ids
             ]
+        result.sources = collect_sources_from_rows(result.rows, source_registry)
+        return result, stats
+
+    system_prompt = """
+You repair missing cells in an existing structured table.
+Use fresh Google Search inside this model call to find grounded answers.
+Do not rely on the previously fetched page bundle from the earlier extraction stage.
+Only fill the requested missing cells. Do not add rows, remove rows, or invent extra columns.
+Use the row's known cells as context when searching.
+Return one fill entry for every requested slot in every provided row.
+If a slot cannot be grounded confidently, return value=null and citations=[] for that slot.
+Every non-null value must include at least one citation with source_title, source_url, and a short verbatim quote.
+Keep values concise and directly usable inside a table cell.
+""".strip()
+    row_map = {row.entity_id: row for row in result.rows}
+    row_chunks = _chunk_rows(
+        capped_row_requests,
+        chunk_size=RECURSIVE_BACKFILL_BATCH_SIZE,
+    )[:RECURSIVE_BACKFILL_MAX_BATCHES]
+    total_chunks = len(row_chunks)
+
+    for chunk_index, row_chunk in enumerate(row_chunks, start=1):
+        if progress_callback is not None:
+            progress_callback(
+                f"Grounded LLM backfill chunk {chunk_index}/{total_chunks} ({len(row_chunk)} row(s))"
+            )
+
+        chunk_slot_count = 0
+        for row_request in row_chunk:
+            entity_id = compact_text(row_request.get("entity_id"))
+            if entity_id:
+                chunk_slot_count += len(missing_keys_by_row.get(entity_id, set()))
+
+        try:
+            rows_payload = json.dumps(
+                row_chunk,
+                ensure_ascii=False,
+                indent=2,
+            )
+            user_prompt = (
+                f"Original query:\n{original_query}\n\n"
+                f"Research objective:\n{research_plan.objective}\n\n"
+                f"Entity type:\n{research_plan.entity_type}\n\n"
+                f"Constraints:\n{json.dumps(research_plan.constraints, ensure_ascii=False)}\n\n"
+                f"Rows with missing cells to backfill:\n{rows_payload}\n"
+            )
+            last_error: Exception | None = None
+            grounded_batch: GroundedBackfillBatch | None = None
+            for attempt in range(2):
+                try:
+                    stats["llm_calls"] += 1
+                    grounded_batch = run_structured_generation(
+                        response_schema=GroundedBackfillBatch,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        model_name=RECURSIVE_BACKFILL_MODEL_NAME,
+                        request_timeout_seconds=90 if attempt == 0 else 120,
+                        max_output_tokens=3000,
+                        google_search=True,
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+            if grounded_batch is None:
+                raise last_error or RuntimeError("Grounded backfill failed without an error")
+
+        except Exception as exc:
+            error_message = str(exc)
+            stats["chunk_errors"].append(
+                {
+                    "chunk_index": chunk_index,
+                    "chunk_count": total_chunks,
+                    "rows": len(row_chunk),
+                    "error": error_message,
+                }
+            )
             stats["queries_run"].append(
                 {
-                    "entity_id": row.entity_id,
-                    "entity_name": entity_name,
-                    "round": round_index,
-                    "query": query,
-                    "missing_keys": [column.key for column in missing_columns],
-                    "search_results": len(selected_results),
+                    "type": "grounded_llm_backfill",
+                    "chunk_index": chunk_index,
+                    "chunk_count": total_chunks,
+                    "rows": len(row_chunk),
+                    "slots": chunk_slot_count,
+                    "error": error_message,
                 }
             )
+            continue
 
-            enriched_results: list[dict[str, str | None]] = []
-            for item in selected_results:
-                url = compact_text(str(item.get("href") or item.get("url") or ""))
-                title = compact_text(str(item.get("title") or ""))
-                snippet = compact_text(str(item.get("body") or item.get("snippet") or ""))
-                if not url or not title:
-                    continue
-
-                source_id = url_to_source_id.get(url)
-                if not source_id:
-                    source_id = f"src_{len(url_to_source_id) + 1:03d}"
-                    url_to_source_id[url] = source_id
-
-                source_registry[source_id] = {
-                    "source_id": source_id,
-                    "title": title,
-                    "url": url,
-                    "snippet": snippet,
-                }
-                enriched_results.append(
-                    {
-                        "source_id": source_id,
-                        "title": title,
-                        "url": url,
-                        "snippet": snippet,
-                    }
-                )
-
-            urls_to_fetch = [
-                result_item["url"]
-                for result_item in enriched_results[:max_fetch_urls]
-                if result_item["url"]
-            ]
-            if not urls_to_fetch:
+        for row_result in grounded_batch.rows:
+            row = row_map.get(row_result.entity_id)
+            if row is None:
                 continue
-
-            if progress_callback is not None:
-                progress_callback(
-                    f"Fetching follow-up sources for {entity_name} ({len(urls_to_fetch)} page(s))"
-                )
-            fetch_output = fetch_tool.run(FetchURLToolInputSchema(value=urls_to_fetch))
-            fetched_records: list[dict[str, str | None]] = []
-            for url, content in zip(urls_to_fetch, fetch_output.result):
-                if fetch_tool.is_error_result(content):
+            allowed_keys = missing_keys_by_row.get(row_result.entity_id, set())
+            for fill in row_result.fills:
+                slot_key = normalize_key(fill.slot_key)
+                if not slot_key or slot_key not in allowed_keys:
                     continue
-
-                source_id = url_to_source_id.get(url)
-                if not source_id:
+                if not _is_slot_missing(
+                    row,
+                    ResearchSlot(
+                        key=slot_key,
+                        label=slot_key,
+                        description="Backfill validation slot",
+                        required=False,
+                    ),
+                ):
                     continue
-
-                source_meta = source_registry[source_id]
-                fetched_records.append(
-                    {
-                        "source_id": source_id,
-                        "title": compact_text(source_meta.get("title")) or url,
-                        "url": url,
-                        "content": truncate_content(content),
-                    }
+                cell = _build_table_cell(
+                    item=fill,
+                    source_registry=source_registry,
+                    url_to_source_id=url_to_source_id,
                 )
+                if cell is None:
+                    continue
+                row.cells[slot_key] = cell
+                stats["cells_filled"] += 1
 
-            if not fetched_records:
-                continue
-
-            current_values = {
-                column.key: row.cells[column.key].value
-                for column in result.columns
-                if column.key in row.cells and row.cells[column.key].value
+        stats["queries_run"].append(
+            {
+                "type": "grounded_llm_backfill",
+                "chunk_index": chunk_index,
+                "chunk_count": total_chunks,
+                "rows": len(row_chunk),
+                "slots": chunk_slot_count,
             }
-            missing_descriptions = [
-                {
-                    "key": column.key,
-                    "label": column.label,
-                    "description": column.description,
-                }
-                for column in missing_columns
-            ]
+        )
 
-            fill_prompt = """
-You fill missing cells for one entity in a structured table.
-Return valid JSON matching the provided schema.
-Only fill keys that are currently missing.
-Do not modify or repeat already-known values.
-Use only the fetched source content below.
-Every returned cell must include at least one citation with exact source_id, source_title, source_url, and a short verbatim quote copied from the fetched content.
-If a missing field is still unresolved, omit it from the response.
-"""
-            fill_user_prompt = (
-                f"Original query:\n{original_query}\n\n"
-                f"Entity name:\n{entity_name}\n\n"
-                f"Known values:\n{json.dumps(current_values, ensure_ascii=False, indent=2)}\n\n"
-                f"Missing columns:\n{json.dumps(missing_descriptions, ensure_ascii=False, indent=2)}\n\n"
-                f"Fetched sources:\n{json.dumps(fetched_records, ensure_ascii=False, indent=2)}\n"
-            )
-
-            try:
-                if progress_callback is not None:
-                    progress_callback(f"Filling missing cells for {entity_name}")
-                fill_result: RecursiveResearchFill = run_structured_generation(
-                    RecursiveResearchFill,
-                    fill_prompt,
-                    fill_user_prompt,
-                )
-            except Exception:
-                continue
-
-            filled_count = merge_recursive_fill(
-                row=row,
-                fill=fill_result,
-                allowed_columns=missing_columns,
-                source_registry=source_registry,
-            )
-            stats["cells_filled"] += filled_count
-            if filled_count > 0:
-                logger.info(
-                    "recursive research filled %d cell(s) for %s",
-                    filled_count,
-                    entity_name,
-                )
-
+    before_filter_count = len(result.rows)
+    result.rows = [
+        row for row in result.rows if not _row_has_missing_target_slot(row, target_slots=target_slots)
+    ]
+    stats["rows_removed_with_missing_values"] = before_filter_count - len(result.rows)
     result.sources = collect_sources_from_rows(result.rows, source_registry)
     return result, stats

@@ -14,6 +14,9 @@ class NullProgressReporter:
     def update(self, message: str) -> None:
         return None
 
+    def log(self, message: str) -> None:
+        return None
+
     def complete(self, message: str = "Done") -> None:
         return None
 
@@ -42,6 +45,9 @@ class CliProgressReporter:
     def update(self, message: str) -> None:
         if self.task_id is not None:
             self.progress.update(self.task_id, description=message)
+
+    def log(self, message: str) -> None:
+        self.console.print(message, highlight=False)
 
     def complete(self, message: str = "Done") -> None:
         if self.task_id is not None:
