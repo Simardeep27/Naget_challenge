@@ -161,7 +161,7 @@ If you only want to run the frontend shell locally, install frontend deps and ru
 ```bash
 cd frontend
 npm install
-npm run dev
+NEXT_PUBLIC_AGENT_URL=http://127.0.0.1:8000 npm run dev
 ```
 
 To connect that local frontend directly to the Python backend without `vercel dev`,
@@ -170,8 +170,6 @@ run the API service separately on port `8000`:
 ```bash
 uv run uvicorn api_service:app --host 127.0.0.1 --port 8000
 ```
-
-The Next.js app now includes local `/api/*` proxy routes that forward to that backend.
 
 If you do not pass a research-depth flag, the CLI will ask whether you want deep research.
 
