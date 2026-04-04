@@ -9,7 +9,9 @@ import type {
 
 interface ResultsPanelProps {
   activeMethod: ResearchMethod;
+  heartbeatCount: number;
   isLoading: boolean;
+  loadingElapsedMs: number;
   loadingLabel: string;
   progressEntries: ResearchProgressEntry[];
   recursiveResearchSelected?: boolean;
@@ -119,6 +121,8 @@ function renderTable(result: StructuredEntityTable) {
 }
 
 function renderLoadingProgress(
+  heartbeatCount: number,
+  loadingElapsedMs: number,
   progressEntries: ResearchProgressEntry[],
   loadingLabel: string,
 ) {
@@ -132,6 +136,7 @@ function renderLoadingProgress(
           },
         ];
   const currentEntry = visibleEntries[visibleEntries.length - 1];
+  const hasHeartbeats = heartbeatCount > 0;
 
   return (
     <div aria-live="polite" className="loadingShell" role="status">
@@ -143,6 +148,14 @@ function renderLoadingProgress(
           </div>
           <p className="eyebrow">Live Progress</p>
           <h3 className="loadingTitle">{currentEntry.message}</h3>
+          <p className="loadingMeta">
+            {hasHeartbeats ? "Backend is still working" : "Waiting for the next progress update"}
+            {" · "}
+            {formatDuration(loadingElapsedMs)} elapsed
+            {hasHeartbeats
+              ? ` · ${heartbeatCount} keep-alive ping${heartbeatCount === 1 ? "" : "s"}`
+              : ""}
+          </p>
         </div>
         <span className="loadingCount">
           {progressEntries.length || 1} step{(progressEntries.length || 1) === 1 ? "" : "s"}
@@ -167,7 +180,9 @@ function renderLoadingProgress(
 
 export function ResultsPanel({
   activeMethod,
+  heartbeatCount,
   isLoading,
+  loadingElapsedMs,
   loadingLabel,
   progressEntries,
   recursiveResearchSelected = false,
@@ -205,7 +220,14 @@ export function ResultsPanel({
         </div>
       </div>
 
-      {isLoading ? renderLoadingProgress(progressEntries, loadingLabel) : null}
+      {isLoading
+        ? renderLoadingProgress(
+            heartbeatCount,
+            loadingElapsedMs,
+            progressEntries,
+            loadingLabel,
+          )
+        : null}
 
       <div className="statsGrid">
         <article className="statCard">

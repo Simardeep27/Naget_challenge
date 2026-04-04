@@ -118,11 +118,14 @@ export function SearchWorkspace() {
   const [selectedModeId, setSelectedModeId] = useState<SearchModeId>(DEFAULT_MODE_ID);
   const [response, setResponse] = useState<InformationAgentResponse | null>(null);
   const [progressEntries, setProgressEntries] = useState<ResearchProgressEntry[]>([]);
+  const [heartbeatCount, setHeartbeatCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isModeMenuOpen, setIsModeMenuOpen] = useState(false);
+  const [loadingElapsedMs, setLoadingElapsedMs] = useState(0);
   const abortControllerRef = useRef<AbortController | null>(null);
   const progressCountRef = useRef(0);
+  const loadingStartedAtRef = useRef<number | null>(null);
   const modeControlRef = useRef<HTMLDivElement | null>(null);
 
   const selectedMode =
@@ -169,6 +172,26 @@ export function SearchWorkspace() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isLoading) {
+      setLoadingElapsedMs(0);
+      return undefined;
+    }
+
+    const intervalId = window.setInterval(() => {
+      const startedAt = loadingStartedAtRef.current;
+      if (!startedAt) {
+        return;
+      }
+
+      setLoadingElapsedMs(Date.now() - startedAt);
+    }, 1000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [isLoading]);
+
   function handleModeSelect(modeId: SearchModeId) {
     setSelectedModeId(modeId);
     setIsModeMenuOpen(false);
@@ -212,7 +235,12 @@ export function SearchWorkspace() {
     let streamedResult: InformationAgentResponse | null = null;
 
     const processEvent = (event: ResearchStreamEvent) => {
-      if (event.type === "heartbeat" || event.type === "done") {
+      if (event.type === "heartbeat") {
+        setHeartbeatCount((currentCount) => currentCount + 1);
+        return;
+      }
+
+      if (event.type === "done") {
         return;
       }
 
@@ -275,6 +303,9 @@ export function SearchWorkspace() {
     abortControllerRef.current = controller;
 
     progressCountRef.current = 1;
+    loadingStartedAtRef.current = Date.now();
+    setHeartbeatCount(0);
+    setLoadingElapsedMs(0);
     setProgressEntries([
       {
         id: "progress-1",
@@ -318,6 +349,7 @@ export function SearchWorkspace() {
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
       }
+      loadingStartedAtRef.current = null;
       setIsLoading(false);
     }
   }
@@ -428,7 +460,9 @@ export function SearchWorkspace() {
         <section className="resultsDock">
           <ResultsPanel
             activeMethod={selectedMode.method}
+            heartbeatCount={heartbeatCount}
             isLoading={isLoading}
+            loadingElapsedMs={loadingElapsedMs}
             loadingLabel={currentProgress}
             progressEntries={progressEntries}
             recursiveResearchSelected={selectedMode.recursiveResearch}

@@ -511,6 +511,14 @@ textarea {
   margin: 0;
 }
 
+.loadingMeta {
+  color: var(--muted);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 0.82rem;
+  line-height: 1.6;
+  margin: -4px 0 0;
+}
+
 .loadingCount {
   color: var(--muted);
   font-family: var(--font-geist-mono), monospace;

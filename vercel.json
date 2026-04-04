@@ -8,7 +8,7 @@
     "agent": {
       "entrypoint": "api_service.py",
       "routePrefix": "/api",
-      "maxDuration": 300,
+      "maxDuration": 420,
       "memory": 2048,
       "excludeFiles": [
         "frontend/**",
