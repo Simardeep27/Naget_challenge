@@ -1,58 +1,139 @@
-# Entity Discovery System
+# Soogle
 
-This project builds a topic-driven entity discovery workflow around [`info_agent.py`].
+**Simardeep’s Google** — a web-search agent that converts open-ended queries into citation-backed structured information.
 
+Soogle is a deterministic research pipeline for users who want structured, traceable outputs from noisy web queries. Instead of relying on a free-form agent loop that repeatedly decides what action to take next, the system builds an explicit research plan, retrieves candidate links, reranks them semantically, reads only the strongest frontier pages, and extracts structured results backed by citations.
 
-# RUNS INFORMATION
+The current focus of the system is **completion quality and result quality** rather than raw latency. Earlier versions were optimized more aggressively for speed, but the pipeline has evolved toward better retrieval decisions, stronger extraction, and more reliable structured outputs.
 
-| Runs | Latency(sec) | 
-|---|---|
-| Normal Search (v1) | 130 | 
-| DeepSearch (v1) | 230 | 
-| Normal Search (v2) | 52.3 | 
-| DeepSearch (v2) | 132.04 | 
+---
 
+## What it does
 
-
-Given a query like:
+Given a query such as:
 
 - `AI startups in healthcare`
 - `top pizza places in Brooklyn`
 - `open source database tools`
 
-the pipeline will:
+Soogle:
 
-1. Build a slot-driven research plan around one core objective.
-2. Retrieve cheap search candidates using metadata only.
-3. Rerank and cluster candidates before fetching any full pages.
-4. Preview the top pages using partial fetches to identify frontier pages.
-5. Full-fetch only the strongest frontier pages.
-6. Run schema-aware extraction driven by required and optional slots.
-7. Fill missing slots with infer -> in-domain expand -> new web search follow-up.
-8. Return JSON output where each populated cell includes source citations.
-9. Write both JSON and markdown outputs to `output/information_agent/`.
+1. Builds a structured research plan from the user query.
+2. Breaks the query into retrieval-oriented intents and likely information needs.
+3. Retrieves candidate links using web search.
+4. Reranks results semantically before doing expensive page reads.
+5. Fully loads only the top-N frontier pages based on the selected strategy.
+6. Extracts relevant data into a structured schema.
+7. Optionally performs recursive backfilling in batches for missing entries.
+8. Returns citation-backed structured JSON and markdown outputs.
 
-This is now a deterministic pipeline. The repo no longer uses an LLM agent loop
-where the model chooses action types like `search_web`, `fetch_url`, or `finish`.
+---
 
-## Main Files
+## Why this design
 
-- [`info_agent.py`](/Users/ssethi/Documents/task/info_agent.py): main static pipeline orchestration
-- [`schema.py`](/Users/ssethi/Documents/task/schema.py): Pydantic schemas for research plans, candidates, previews, and structured output
-- [`tools/research_planner.py`](/Users/ssethi/Documents/task/tools/research_planner.py): slot-driven planner
-- [`tools/web_search_tool.py`](/Users/ssethi/Documents/task/tools/web_search_tool.py): search tool
-- [`tools/fetch_url.py`](/Users/ssethi/Documents/task/tools/fetch_url.py): preview + full-fetch tool
-- [`tools/write_to_file.py`](/Users/ssethi/Documents/task/tools/write_to_file.py): file writer
-- [`utils/tiered_research.py`](/Users/ssethi/Documents/task/utils/tiered_research.py): candidate retrieval, reranking, previewing, and slot-aware extraction helpers
-- [`utils/recursive_research.py`](/Users/ssethi/Documents/task/utils/recursive_research.py): slot-level follow-up logic
+Earlier experiments used a more agentic loop where the model chose actions such as searching, fetching, and deciding when to stop. In practice, that approach was harder to control, more expensive, and less predictable.
 
-## Install
+Soogle instead uses a **deterministic slot-driven pipeline**. The design decisions were guided by a few goals:
 
-Using `pip`:
+- **Better completion quality** by explicitly modeling missing information.
+- **Higher result quality** by reranking search results before full page reads.
+- **Lower unnecessary fetch cost** by avoiding naive HTML loading for every retrieved result.
+- **Traceability** by attaching source citations to populated output cells.
+- **Controllability** through selectable research strategies such as standard, deep, and lightning.
 
-```bash
-python3 -m pip install -r requirements.txt
+This makes the pipeline easier to inspect, tune, and evaluate as a research system.
+
+---
+
+## Approach
+
+### 1. Research plan construction
+The user query is first transformed into a structured research plan. This plan captures:
+
+- the main objective
+- sub-intents
+- probable supporting information
+- likely fields needed to answer the query well
+
+This gives the pipeline an explicit target structure before retrieval begins.
+
+### 2. Candidate retrieval
+The system retrieves initial links using web search. Earlier versions used a more naive pattern of reading many retrieved pages directly. The current pipeline instead treats search results as cheap candidates and delays expensive reads until after filtering.
+
+### 3. Semantic reranking
+Retrieved links are reranked using semantic relevance. This step is one of the key design changes in the system: rather than trusting search rank alone, Soogle reorders candidates according to how well they match the research plan and likely answer requirements.
+
+### 4. Frontier selection and full-page reads
+Only the strongest frontier pages are fully loaded. The number of pages fetched depends on the chosen strategy:
+
+- **Lightning**: more aggressive pruning, lower cost, faster turnaround
+- **Standard**: balanced retrieval depth
+- **Deep research**: higher recall and more complete extraction at the cost of latency
+
+### 5. Structured extraction
+Once frontier pages are available, the pipeline uses the research plan and fetched content to extract structured results. The output is schema-aware and designed to produce citation-backed fields rather than free-form text summaries.
+
+### 6. Recursive research for missing entries
+If recursive research is enabled, the system inspects missing or incomplete entries and performs batched backfilling. This improves completion quality, but introduces additional latency. This mode is useful when the query requires broader coverage or when partial missingness matters.
+
+---
+
+## Architecture
+
+```text
+User Query
+   ↓
+Research Planner
+   ↓
+Intent-aware Search Query Generation
+   ↓
+Web Search Candidate Retrieval
+   ↓
+Semantic Reranking / Filtering
+   ↓
+Preview / Frontier Selection
+   ↓
+Top-N Full Page Fetch
+   ↓
+Schema-aware Extraction
+   ↓
+(Optional) Recursive Backfilling for Missing Entries
+   ↓
+Citation-backed JSON + Markdown Output
 ```
+
+
+## Main Components
+
+- **`info_agent.py`** — main static pipeline orchestration  
+- **`schema.py`** — Pydantic schemas for research plans, candidates, previews, and structured output  
+- **`tools/research_planner.py`** — slot-driven planner  
+- **`tools/web_search_tool.py`** — search tool  
+- **`tools/fetch_url.py`** — preview and full-fetch tool  
+- **`tools/write_to_file.py`** — file writer  
+- **`utils/tiered_research.py`** — candidate retrieval, reranking, previewing, and slot-aware extraction helpers  
+- **`utils/recursive_research.py`** — slot-level follow-up logic  
+- **`api_service.py`** — Python API service  
+- **`frontend/`** — Vercel-ready Next.js frontend
+
+## Demo UI
+
+The project includes a demo-ready frontend with support for:
+
+- a chat-style research composer  
+- selectable methods: **standard**, **deep research**, and **lightning**  
+- optional recursive filling  
+- tabular structured result rendering  
+- execution metadata  
+- search path visibility  
+- live API-backed research execution  
+
+<!-- ![Soogle Home](./docs/soogle-home.png) -->
+<!-- ![Soogle Results](./docs/soogle-results.png) -->
+
+## Setup
+
+### 1. Install dependencies
 
 Using `uv`:
 
@@ -60,11 +141,17 @@ Using `uv`:
 uv sync
 ```
 
-## Environment
+Or using `pip`:
 
-Secrets and deployment-specific settings should go in `.env`.
+```bash
+python3 -m pip install -r requirements.txt
+```
 
-For Google Cloud Vertex AI, set these values there:
+### 2. Configure environment variables
+
+Create a `.env` file for secrets and deployment-specific settings.
+
+For Vertex AI:
 
 ```bash
 GOOGLE_CLOUD_PROJECT=your-gcp-project-id
@@ -73,17 +160,23 @@ GOOGLE_GENAI_USE_VERTEXAI=True
 INFORMATION_AGENT_MODEL=gemini-2.5-flash
 ```
 
-OpenAI-compatible variables are still supported as a fallback when `GOOGLE_GENAI_USE_VERTEXAI` is not enabled.
+OpenAI-compatible variables can still be supported as a fallback when Vertex AI is not enabled.
 
-## Configuration
+### 3. Authenticate with Google Cloud
 
-Non-secret runtime tuning now lives in [`config.yaml`](/Users/ssethi/Documents/task/config.yaml), including:
+```bash
+gcloud auth application-default login
+```
+
+### 4. Configure runtime settings
+
+Non-secret runtime tuning lives in `config.yaml`. This includes:
 
 - output paths
+- search provider and timeout
 - standard/deep/lightning mode limits
-- recursive-research limits
-- default search provider and timeout
-- default model fallbacks
+- recursive research limits
+- model fallback behavior
 
 Example:
 
@@ -101,48 +194,16 @@ modes:
     fetch_url_limit: 2
 ```
 
-Environment variables can still override these values when needed, but `config.yaml` is now the primary place to tune the system.
+## Running the Project
 
-You also need Google Cloud credentials available locally, typically:
+### Option 1: Vercel deployment (recommended)
 
-```bash
-gcloud auth application-default login
-```
+This is the primary setup path for the project.
 
-## Run
+The repository includes a root `vercel.json` configured for Vercel Services:
 
-Run the main agent directly:
-
-```bash
-uv run python info_agent.py "AI startups in healthcare"
-```
-
-Or use the small wrapper:
-
-```bash
-uv run python main.py "top pizza places in Brooklyn"
-```
-
-## Web Frontend
-
-A Vercel-ready Next.js frontend now lives in [`frontend/`](/Users/ssethi/Documents/task/frontend).
-It provides:
-
-- a chat-style research composer
-- selectable methods: standard, deep, lightning
-- an optional recursive-fill toggle
-- tabular result rendering with sources and execution metadata
-
-The frontend expects a same-origin API at `/api/research`.
-Live progress updates stream over `/api/research/stream`.
-
-## Vercel Services Setup
-
-This repo includes a root [`vercel.json`](/Users/ssethi/Documents/task/vercel.json)
-configured for Vercel Services:
-
-- `web` -> [`frontend/`](/Users/ssethi/Documents/task/frontend)
-- `agent` -> [`api_service.py`](/Users/ssethi/Documents/task/api_service.py)
+- `web` → `frontend/`
+- `agent` → `api_service.py`
 
 The Python service exposes:
 
@@ -150,30 +211,27 @@ The Python service exposes:
 - `POST /api/research`
 - `POST /api/research/stream`
 
-For local multi-service development, use:
+For local multi-service development with Vercel:
 
 ```bash
 vercel dev -L
 ```
 
-If you only want to run the frontend shell locally, install frontend deps and run:
+### Option 2: CLI
+
+Run the main pipeline directly:
 
 ```bash
-cd frontend
-npm install
-NEXT_PUBLIC_AGENT_URL=http://127.0.0.1:8000 npm run dev
+uv run python info_agent.py "AI startups in healthcare"
 ```
 
-To connect that local frontend directly to the Python backend without `vercel dev`,
-run the API service separately on port `8000`:
+Or use the wrapper:
 
 ```bash
-uv run uvicorn api_service:app --host 127.0.0.1 --port 8000
+uv run python main.py "top pizza places in Brooklyn"
 ```
 
-If you do not pass a research-depth flag, the CLI will ask whether you want deep research.
-
-You can also set it explicitly:
+You can also choose an explicit research mode:
 
 ```bash
 uv run python info_agent.py "open source database tools" --deep-research
@@ -182,9 +240,27 @@ uv run python info_agent.py "open source database tools" --recursive-research
 uv run python info_agent.py "open source database tools" --lightning
 ```
 
-## Output
+### Option 3: Local API + frontend
 
-The run returns an `InformationAgentOutput` JSON object with:
+Run the backend:
+
+```bash
+uv run uvicorn api_service:app --host 127.0.0.1 --port 8000
+```
+
+Run the frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The frontend includes local `/api/*` proxy routes to forward requests to the backend.
+
+## Output Format
+
+The pipeline returns an `InformationAgentOutput` object with:
 
 - `status`
 - `json_file_path`
@@ -192,9 +268,15 @@ The run returns an `InformationAgentOutput` JSON object with:
 - `result`
 - `meta`
 
-The `meta` object includes the selected research depth, the slot-driven research plan, candidate/frontier counts, and slot-follow-up stats when the pipeline had to backfill missing required or optional slots.
+The `meta` section includes information such as:
 
-Inside `result`:
+- selected research depth
+- research plan
+- candidate counts
+- frontier counts
+- follow-up statistics for recursive slot filling
+
+The `result` section contains:
 
 - `query`
 - `title`
@@ -202,7 +284,7 @@ Inside `result`:
 - `rows`
 - `sources`
 
-Each populated cell looks like:
+Each populated field is citation-backed. Example:
 
 ```json
 {
@@ -218,4 +300,25 @@ Each populated cell looks like:
 }
 ```
 
-This satisfies the traceability requirement: every non-empty cell is backed by one or more fetched sources.
+This makes the output easier to verify, debug, and reuse downstream.
+
+## Performance Note
+
+The current pipeline prioritizes retrieval quality and completion quality more than raw speed.
+
+- Earlier iterations focused more aggressively on latency.
+- The current direction adds stronger reranking and optional recursive backfilling.
+- A recent pipeline version takes roughly `~180 seconds` in the deep pipeline setting.
+
+This is an active tradeoff rather than an accident: the system is currently optimized to improve answer completeness and structured output quality.
+
+## Known Limitations
+
+- The system can still be slow, especially under DDGS rate limits.
+- Recursive research improves completeness, but increases latency.
+- Search quality is still partly constrained by external search provider behavior.
+- The current search stack may be further improved with a custom semantic scraper to reduce dependency on external limits and improve retrieval control.
+
+## Future Direction
+
+A major next step is replacing part of the current retrieval dependency with a more controllable semantic scraping layer. The goal is to reduce search bottlenecks, improve frontier selection, and lower the latency introduced by repeated external search constraints.
