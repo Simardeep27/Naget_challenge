@@ -1,4 +1,5 @@
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", PROJECT_ROOT / "config.yaml"))
+RUNTIME_TMP_ROOT = Path(tempfile.gettempdir()) / "information_agent"
 
 
 class OutputSettings(BaseModel):
@@ -345,11 +347,21 @@ def get_fetch_timeout_seconds() -> int:
     return get_settings().fetch.timeout_seconds
 
 
-def get_fetch_cache_dir() -> Path:
-    configured_path = Path(get_settings().fetch.cache_dir)
+def _resolve_runtime_dir(configured_dir: str) -> Path:
+    configured_path = Path(configured_dir)
     if configured_path.is_absolute():
         return configured_path
+
+    # Vercel mounts the deployed code under /var/task, which is read-only.
+    # Keep local relative paths in-repo, but move serverless runtime data to /tmp.
+    if os.getenv("VERCEL") == "1":
+        return RUNTIME_TMP_ROOT / configured_path
+
     return PROJECT_ROOT / configured_path
+
+
+def get_fetch_cache_dir() -> Path:
+    return _resolve_runtime_dir(get_settings().fetch.cache_dir)
 
 
 def get_fetch_cache_ttl_seconds() -> int:
@@ -357,10 +369,7 @@ def get_fetch_cache_ttl_seconds() -> int:
 
 
 def get_vertex_cache_dir() -> Path:
-    configured_path = Path(get_settings().vertex_cache.dir)
-    if configured_path.is_absolute():
-        return configured_path
-    return PROJECT_ROOT / configured_path
+    return _resolve_runtime_dir(get_settings().vertex_cache.dir)
 
 
 def get_vertex_cache_ttl_seconds() -> int:
