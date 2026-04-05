@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import tempfile
 from functools import lru_cache
@@ -301,6 +303,26 @@ def get_vertex_project() -> str:
 
 def get_vertex_location() -> str:
     return os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global"
+
+
+@lru_cache(maxsize=1)
+def get_google_service_account_json() -> str | None:
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    encoded_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_BASE64", "").strip()
+
+    if not raw_json and encoded_json:
+        try:
+            raw_json = base64.b64decode(encoded_json).decode("utf-8").strip()
+        except Exception:
+            return None
+
+    if not raw_json:
+        return None
+
+    try:
+        return json.dumps(json.loads(raw_json), sort_keys=True)
+    except json.JSONDecodeError:
+        return None
 
 
 def get_output_dir() -> Path:

@@ -12,6 +12,7 @@ from openai import OpenAI
 from utils.config import (
     get_api_key,
     get_base_url,
+    get_google_service_account_json,
     get_model_name,
     get_vertex_cache_dir,
     get_vertex_cache_ttl_seconds,
@@ -28,12 +29,22 @@ def _get_vertex_client(
     project: str,
     location: str,
     timeout_ms: int | None,
+    service_account_json: str | None,
 ):
     from google import genai
     from google.genai import types
+    from google.oauth2 import service_account
+
+    credentials = None
+    if service_account_json:
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(service_account_json),
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
 
     return genai.Client(
         vertexai=True,
+        credentials=credentials,
         project=project,
         location=location,
         http_options=types.HttpOptions(
@@ -198,6 +209,7 @@ def run_structured_generation(
                 if request_timeout_seconds is not None
                 else None
             ),
+            get_google_service_account_json(),
         )
         direct_config = types.GenerateContentConfig(
             system_instruction=system_prompt,

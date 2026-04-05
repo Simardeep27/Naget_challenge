@@ -168,6 +168,21 @@ OpenAI-compatible variables can still be supported as a fallback when Vertex AI 
 gcloud auth application-default login
 ```
 
+For Vercel or other serverless deployments, local ADC is not available by default.
+Set one of these environment variables instead:
+
+```bash
+GOOGLE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
+```
+
+or
+
+```bash
+GOOGLE_SERVICE_ACCOUNT_BASE64=base64-encoded-service-account-json
+```
+
+The service account needs Vertex AI access for both content generation and cached-content operations.
+
 ### 4. Configure runtime settings
 
 Non-secret runtime tuning lives in `config.yaml`. This includes:
