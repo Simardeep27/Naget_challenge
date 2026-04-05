@@ -1,4 +1,4 @@
-# Soogle
+# Soogle (https://naget-challenge.vercel.app?_vercel_share=S3s4WzDoGPbs62K2WiwmqLYGxYUhTs7Z)
 
 Soogle is a structured web-research system that turns an open-ended query into a
 citation-backed table. The project combines a Python research pipeline with a
