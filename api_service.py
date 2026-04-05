@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""FastAPI transport layer for the research pipeline."""
+
 import json
 import os
 from enum import Enum
@@ -15,6 +17,9 @@ from pydantic import BaseModel, Field
 os.environ.setdefault("OUTPUT_DIR", "/tmp/information_agent")
 
 from info_agent import run_information_agent
+
+STREAM_HEARTBEAT_SECONDS = 10
+ProgressCallback = Callable[[str], None]
 
 
 class ResearchMethod(str, Enum):
@@ -72,7 +77,7 @@ def _run_research(
     *,
     query: str,
     payload: ResearchRequest,
-    progress_callback: Callable[[str], None] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     try:
         raw_result = run_information_agent(
@@ -97,6 +102,20 @@ def _encode_stream_event(event: dict[str, Any]) -> bytes:
     return (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def _build_stream_event(
+    event_type: str,
+    *,
+    message: str | None = None,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": event_type}
+    if message is not None:
+        event["message"] = message
+    if data is not None:
+        event["data"] = data
+    return event
+
+
 def _stream_research(
     *,
     query: str,
@@ -110,12 +129,13 @@ def _stream_research(
         message: str | None = None,
         data: dict[str, Any] | None = None,
     ) -> None:
-        event: dict[str, Any] = {"type": event_type}
-        if message is not None:
-            event["message"] = message
-        if data is not None:
-            event["data"] = data
-        event_queue.put(event)
+        event_queue.put(
+            _build_stream_event(
+                event_type,
+                message=message,
+                data=data,
+            )
+        )
 
     def worker() -> None:
         try:
@@ -136,13 +156,13 @@ def _stream_research(
 
     while True:
         try:
-            event = event_queue.get(timeout=10)
+            event = event_queue.get(timeout=STREAM_HEARTBEAT_SECONDS)
         except Empty:
-            yield _encode_stream_event({"type": "heartbeat"})
+            yield _encode_stream_event(_build_stream_event("heartbeat"))
             continue
 
         if event is None:
-            yield _encode_stream_event({"type": "done"})
+            yield _encode_stream_event(_build_stream_event("done"))
             break
 
         yield _encode_stream_event(event)

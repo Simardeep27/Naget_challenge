@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Main orchestration for the deterministic research pipeline."""
+
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -53,6 +55,16 @@ class PipelineBudgets:
     initial_query_budget: int
     frontier_size: int
     max_frontier_batches: int
+
+
+@dataclass(frozen=True)
+class InformationTools:
+    """Typed container for the concrete tools used by one run."""
+
+    planner_tool: ResearchPlannerTool
+    search_tool: SearchTool
+    fetch_url_tool: FetchURLTool
+    write_file_tool: WriteToFileTool
 
 
 @dataclass
@@ -157,7 +169,7 @@ def _build_pipeline_budgets(
 def create_information_tools(
     deep_research: bool = False,
     lightning: bool = False,
-) -> dict[str, object]:
+) -> InformationTools:
     if lightning:
         search_config = SearchToolConfig(
             max_results=get_lightning_search_result_limit(),
@@ -166,12 +178,12 @@ def create_information_tools(
     else:
         search_config = SearchToolConfig(max_results=get_search_result_limit(deep_research))
 
-    return {
-        "planner_tool": ResearchPlannerTool(),
-        "search_tool": SearchTool(search_config),
-        "fetch_url_tool": FetchURLTool(BaseToolConfig()),
-        "write_file_tool": WriteToFileTool(BaseToolConfig()),
-    }
+    return InformationTools(
+        planner_tool=ResearchPlannerTool(),
+        search_tool=SearchTool(search_config),
+        fetch_url_tool=FetchURLTool(BaseToolConfig()),
+        write_file_tool=WriteToFileTool(BaseToolConfig()),
+    )
 
 
 def _finalize_table(
@@ -465,10 +477,10 @@ def run_information_agent(
     mode = _mode_name(deep_research=deep_research, lightning=lightning)
     progress_callback(f"Initializing {mode} pipeline")
     tools = create_information_tools(deep_research=deep_research, lightning=lightning)
-    planner_tool: ResearchPlannerTool = tools["planner_tool"]  # type: ignore[assignment]
-    search_tool: SearchTool = tools["search_tool"]  # type: ignore[assignment]
-    fetch_tool: FetchURLTool = tools["fetch_url_tool"]  # type: ignore[assignment]
-    write_tool: WriteToFileTool = tools["write_file_tool"]  # type: ignore[assignment]
+    planner_tool = tools.planner_tool
+    search_tool = tools.search_tool
+    fetch_tool = tools.fetch_url_tool
+    write_tool = tools.write_file_tool
 
     progress_callback("Building research plan")
     research_plan = planner_tool.run(

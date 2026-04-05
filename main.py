@@ -1,10 +1,12 @@
+"""CLI entry point for running the research pipeline locally."""
+
 import argparse
 
 from info_agent import resolve_deep_research_choice, run_information_agent
 from utils.progress import CliProgressReporter
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the entity-discovery info agent for a topic query."
     )
@@ -38,6 +40,11 @@ def main():
             "Run the same static pipeline with smaller search, preview, and fetch budgets"
         ),
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     if args.lightning and args.deep_research is True:
         parser.error("--lightning cannot be combined with --deep-research")

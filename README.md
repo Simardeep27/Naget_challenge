@@ -1,14 +1,10 @@
 # Soogle
 
-**Simardeep’s Google** — a web-search agent that converts open-ended queries into citation-backed structured information.
+Soogle is a structured web-research system that turns an open-ended query into a
+citation-backed table. The project combines a Python research pipeline with a
+minimal Next.js frontend and a FastAPI streaming API.
 
-Soogle is a deterministic research pipeline for users who want structured, traceable outputs from noisy web queries. Instead of relying on a free-form agent loop that repeatedly decides what action to take next, the system builds an explicit research plan, retrieves candidate links, reranks them semantically, reads only the strongest frontier pages, and extracts structured results backed by citations.
-
-The current focus of the system is **completion quality and result quality** rather than raw latency. Earlier versions were optimized more aggressively for speed, but the pipeline has evolved toward better retrieval decisions, stronger extraction, and more reliable structured outputs.
-
----
-
-## What it does
+## What It Does
 
 Given a query such as:
 
@@ -18,118 +14,82 @@ Given a query such as:
 
 Soogle:
 
-1. Builds a structured research plan from the user query.
-2. Breaks the query into retrieval-oriented intents and likely information needs.
-3. Retrieves candidate links using web search.
-4. Reranks results semantically before doing expensive page reads.
-5. Fully loads only the top-N frontier pages based on the selected strategy.
-6. Extracts relevant data into a structured schema.
-7. Optionally performs recursive backfilling in batches for missing entries.
-8. Returns citation-backed structured JSON and markdown outputs.
+1. Builds a slot-driven research plan for the query.
+2. Generates a small set of retrieval queries.
+3. Retrieves and reranks candidate pages.
+4. Fetches only the strongest frontier pages.
+5. Extracts structured rows with source-backed citations.
+6. Optionally runs recursive follow-up research to fill missing slots.
+7. Writes both JSON and markdown artifacts.
 
----
-
-## Why this design
-
-Earlier experiments used a more agentic loop where the model chose actions such as searching, fetching, and deciding when to stop. In practice, that approach was harder to control, more expensive, and less predictable.
-
-Soogle instead uses a **deterministic slot-driven pipeline**. The design decisions were guided by a few goals:
-
-- **Better completion quality** by explicitly modeling missing information.
-- **Higher result quality** by reranking search results before full page reads.
-- **Lower unnecessary fetch cost** by avoiding naive HTML loading for every retrieved result.
-- **Traceability** by attaching source citations to populated output cells.
-- **Controllability** through selectable research strategies such as standard, deep, and lightning.
-
-This makes the pipeline easier to inspect, tune, and evaluate as a research system.
-
----
+The system is intentionally deterministic at the orchestration layer. Instead of
+letting the model choose arbitrary actions in a loop, the pipeline follows a
+fixed sequence of planning, retrieval, frontier selection, extraction, and
+optional backfilling.
 
 ## Approach
 
-### 1. Research plan construction
-The user query is first transformed into a structured research plan. This plan captures:
-
-- the main objective
-- sub-intents
-- probable supporting information
-- likely fields needed to answer the query well
-
-This gives the pipeline an explicit target structure before retrieval begins.
-
-### 2. Candidate retrieval
-The system retrieves initial links using web search. Earlier versions used a more naive pattern of reading many retrieved pages directly. The current pipeline instead treats search results as cheap candidates and delays expensive reads until after filtering.
-
-### 3. Semantic reranking
-Retrieved links are reranked using semantic relevance. This step is one of the key design changes in the system: rather than trusting search rank alone, Soogle reorders candidates according to how well they match the research plan and likely answer requirements.
-
-### 4. Frontier selection and full-page reads
-Only the strongest frontier pages are fully loaded. The number of pages fetched depends on the chosen strategy:
-
-- **Lightning**: more aggressive pruning, lower cost, faster turnaround
-- **Standard**: balanced retrieval depth
-- **Deep research**: higher recall and more complete extraction at the cost of latency
-
-### 5. Structured extraction
-Once frontier pages are available, the pipeline uses the research plan and fetched content to extract structured results. The output is schema-aware and designed to produce citation-backed fields rather than free-form text summaries.
-
-### 6. Recursive research for missing entries
-If recursive research is enabled, the system inspects missing or incomplete entries and performs batched backfilling. This improves completion quality, but introduces additional latency. This mode is useful when the query requires broader coverage or when partial missingness matters.
-
----
-
-## Architecture
+### Pipeline
 
 ```text
 User Query
-   ↓
-Research Planner
-   ↓
-Intent-aware Search Query Generation
-   ↓
-Web Search Candidate Retrieval
-   ↓
-Semantic Reranking / Filtering
-   ↓
-Preview / Frontier Selection
-   ↓
-Top-N Full Page Fetch
-   ↓
-Schema-aware Extraction
-   ↓
-(Optional) Recursive Backfilling for Missing Entries
-   ↓
-Citation-backed JSON + Markdown Output
+   -> Research Planner
+   -> Search Query Generation
+   -> Candidate Search
+   -> Semantic Rerank
+   -> Frontier Fetch
+   -> Structured Extraction
+   -> Optional Recursive Backfill
+   -> JSON + Markdown Output
 ```
 
+### Research Modes
 
-## Main Components
+- `standard`: balanced search and fetch budgets
+- `deep`: broader retrieval and more exhaustive extraction
+- `lightning`: smaller budgets for faster turnaround
+- `recursive research`: deep mode plus targeted backfilling of missing cells
 
-- **`info_agent.py`** — main static pipeline orchestration  
-- **`schema.py`** — Pydantic schemas for research plans, candidates, previews, and structured output  
-- **`tools/research_planner.py`** — slot-driven planner  
-- **`tools/web_search_tool.py`** — search tool  
-- **`tools/fetch_url.py`** — preview and full-fetch tool  
-- **`tools/write_to_file.py`** — file writer  
-- **`utils/tiered_research.py`** — candidate retrieval, reranking, previewing, and slot-aware extraction helpers  
-- **`utils/recursive_research.py`** — slot-level follow-up logic  
-- **`api_service.py`** — Python API service  
-- **`frontend/`** — Vercel-ready Next.js frontend
+### Design Goals
 
-## Demo UI
+- Keep the orchestration understandable and debuggable.
+- Optimize for traceable, citation-backed structured output.
+- Separate retrieval, extraction, and rendering concerns.
+- Surface progress in both the CLI and the frontend.
 
-The project includes a demo-ready frontend with support for:
+## Repository Layout
 
-- a chat-style research composer  
-- selectable methods: **standard**, **deep research**, and **lightning**  
-- optional recursive filling  
-- tabular structured result rendering  
-- execution metadata  
-- search path visibility  
-- live API-backed research execution  
+The codebase is intentionally split by responsibility:
 
-<!-- ![Soogle Home](./docs/soogle-home.png) -->
-<!-- ![Soogle Results](./docs/soogle-results.png) -->
+```text
+.
+├── api_service.py              # FastAPI service and streaming endpoints
+├── info_agent.py               # Main pipeline orchestration
+├── main.py                     # CLI entry point
+├── schema.py                   # Shared Pydantic schemas
+├── tools/
+│   ├── research_planner.py     # Query -> ResearchPlan
+│   ├── web_search_tool.py      # Search provider wrapper
+│   ├── fetch_url.py            # Page fetch + extraction cache
+│   └── write_to_file.py        # Output artifact writing
+├── utils/
+│   ├── config.py               # Settings and environment resolution
+│   ├── llm_utils.py            # Structured LLM / Vertex helpers
+│   ├── tiered_research.py      # Candidate ranking + table extraction helpers
+│   ├── recursive_research.py   # Follow-up slot backfilling
+│   ├── result_utils.py         # Normalization and citation shaping
+│   ├── progress.py             # CLI progress reporting
+│   └── text_utils.py           # Shared text-formatting helpers
+├── frontend/
+│   ├── app/                    # Next.js app router entrypoints
+│   ├── components/             # Search page and results UI
+│   └── lib/types.ts            # Frontend response types
+├── config.yaml                 # Runtime tuning
+└── vercel.json                 # Vercel Services configuration
+```
+
+A longer architecture walkthrough lives in
+[docs/architecture.md](/Users/ssethi/Documents/task/docs/architecture.md).
 
 ## Setup
 
@@ -141,7 +101,7 @@ Using `uv`:
 uv sync
 ```
 
-Or using `pip`:
+Using `pip`:
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -149,27 +109,35 @@ python3 -m pip install -r requirements.txt
 
 ### 2. Configure environment variables
 
-Create a `.env` file for secrets and deployment-specific settings.
+Create a `.env` file with deployment-specific secrets.
 
-For Vertex AI:
+Vertex AI example:
 
 ```bash
 GOOGLE_CLOUD_PROJECT=your-gcp-project-id
 GOOGLE_CLOUD_LOCATION=global
-GOOGLE_GENAI_USE_VERTEXAI=True
+GOOGLE_GENAI_USE_VERTEXAI=true
 INFORMATION_AGENT_MODEL=gemini-2.5-flash
 ```
 
-OpenAI-compatible variables can still be supported as a fallback when Vertex AI is not enabled.
+OpenAI-compatible example:
 
-### 3. Authenticate with Google Cloud
+```bash
+GOOGLE_GENAI_USE_VERTEXAI=false
+OPENAI_API_KEY=your-key
+OPENAI_MODEL=gpt-4.1-mini
+```
+
+### 3. Authenticate
+
+For local development with Vertex AI:
 
 ```bash
 gcloud auth application-default login
 ```
 
-For Vercel or other serverless deployments, local ADC is not available by default.
-Set one of these environment variables instead:
+For Vercel or another serverless deployment, local ADC is not available.
+Instead, provide one of:
 
 ```bash
 GOOGLE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
@@ -181,58 +149,24 @@ or
 GOOGLE_SERVICE_ACCOUNT_BASE64=base64-encoded-service-account-json
 ```
 
-The service account needs Vertex AI access for both content generation and cached-content operations.
+The service account needs Vertex AI access for both standard generation and
+cached-content calls.
 
-### 4. Configure runtime settings
+### 4. Tune runtime settings
 
-Non-secret runtime tuning lives in `config.yaml`. This includes:
+Non-secret runtime settings live in [config.yaml](/Users/ssethi/Documents/task/config.yaml).
+This file controls:
 
 - output paths
 - search provider and timeout
-- standard/deep/lightning mode limits
-- recursive research limits
-- model fallback behavior
+- standard, deep, and lightning mode budgets
+- recursive-research limits
+- cache TTLs
+- default model selection
 
-Example:
+## Running The Project
 
-```yaml
-search:
-  provider: duckduckgo
-  timeout_seconds: 5
-
-modes:
-  standard:
-    search_result_limit: 8
-    fetch_limit: 6
-  lightning:
-    max_search_queries: 3
-    fetch_url_limit: 2
-```
-
-## Running the Project
-
-### Option 1: Vercel deployment (recommended)
-
-This is the primary setup path for the project.
-
-The repository includes a root `vercel.json` configured for Vercel Services:
-
-- `web` → `frontend/`
-- `agent` → `api_service.py`
-
-The Python service exposes:
-
-- `GET /api/health`
-- `POST /api/research`
-- `POST /api/research/stream`
-
-For local multi-service development with Vercel:
-
-```bash
-vercel dev -L
-```
-
-### Option 2: CLI
+### CLI
 
 Run the main pipeline directly:
 
@@ -240,13 +174,13 @@ Run the main pipeline directly:
 uv run python info_agent.py "AI startups in healthcare"
 ```
 
-Or use the wrapper:
+Or use the small wrapper:
 
 ```bash
 uv run python main.py "top pizza places in Brooklyn"
 ```
 
-You can also choose an explicit research mode:
+Explicit mode examples:
 
 ```bash
 uv run python info_agent.py "open source database tools" --deep-research
@@ -255,23 +189,57 @@ uv run python info_agent.py "open source database tools" --recursive-research
 uv run python info_agent.py "open source database tools" --lightning
 ```
 
-### Option 3: Local API + frontend
+### Local API
 
-Run the backend:
+Run the backend service:
 
 ```bash
 uv run uvicorn api_service:app --host 127.0.0.1 --port 8000
 ```
 
-Run the frontend:
+Available endpoints:
+
+- `GET /health`
+- `POST /research`
+- `POST /research/stream`
+
+### Local Frontend
+
+Run the frontend against the local API:
 
 ```bash
 cd frontend
 npm install
-npm run dev
+NEXT_PUBLIC_AGENT_URL=http://127.0.0.1:8000 npm run dev
 ```
 
-The frontend includes local `/api/*` proxy routes to forward requests to the backend.
+### Vercel
+
+This repository is configured for Vercel Services via
+[vercel.json](/Users/ssethi/Documents/task/vercel.json):
+
+- `web` -> `frontend/`
+- `agent` -> `api_service.py`
+
+High-level deploy flow:
+
+1. Import the repo into Vercel from the repository root.
+2. Add the required environment variables.
+3. Redeploy after every env-var change.
+4. Verify `GET /api/health`.
+5. Verify a full streamed request against `POST /api/research/stream`.
+
+## Frontend Overview
+
+The frontend is intentionally small:
+
+- a centered search-first landing page
+- a mode picker for deep and recursive research
+- live progress rendering from the streaming API
+- a results area for tables, sources, and execution metadata
+
+The frontend does not implement research logic itself. It only submits requests
+to the backend and renders streamed progress plus the final structured result.
 
 ## Output Format
 
@@ -283,15 +251,7 @@ The pipeline returns an `InformationAgentOutput` object with:
 - `result`
 - `meta`
 
-The `meta` section includes information such as:
-
-- selected research depth
-- research plan
-- candidate counts
-- frontier counts
-- follow-up statistics for recursive slot filling
-
-The `result` section contains:
+`result` contains:
 
 - `query`
 - `title`
@@ -299,7 +259,7 @@ The `result` section contains:
 - `rows`
 - `sources`
 
-Each populated field is citation-backed. Example:
+Each populated cell is citation-backed. Example:
 
 ```json
 {
@@ -315,25 +275,35 @@ Each populated field is citation-backed. Example:
 }
 ```
 
-This makes the output easier to verify, debug, and reuse downstream.
+This keeps the output auditable and easier to debug.
 
-## Performance Note
+## Code Structure Notes
 
-The current pipeline prioritizes retrieval quality and completion quality more than raw speed.
+The codebase is organized around a few clear boundaries:
 
-- Earlier iterations focused more aggressively on latency.
-- The current direction adds stronger reranking and optional recursive backfilling.
-- A recent pipeline version takes roughly `~180 seconds` in the deep pipeline setting.
+- `info_agent.py` owns pipeline orchestration only.
+- `tools/` owns external actions such as search, fetch, and write.
+- `utils/` owns cross-cutting logic like config, normalization, prompting, and progress.
+- `schema.py` keeps the shared data model in one place.
+- `frontend/` is isolated from backend internals and consumes typed API responses.
 
-This is an active tradeoff rather than an accident: the system is currently optimized to improve answer completeness and structured output quality.
+The repo still has room for further cleanup, but the current structure keeps the
+main responsibilities separated and makes it possible to reason about each stage
+in isolation.
 
 ## Known Limitations
 
-- The system can still be slow, especially under DDGS rate limits.
-- Recursive research improves completeness, but increases latency.
-- Search quality is still partly constrained by external search provider behavior.
-- The current search stack may be further improved with a custom semantic scraper to reduce dependency on external limits and improve retrieval control.
+- Deep and recursive research can be slow because the system prioritizes result quality over latency.
+- Search quality depends on third-party providers and their rate limits.
+- Some sites block scraping or return `403` responses, which can reduce coverage.
+- Structured extraction can still degrade when upstream model responses are malformed or incomplete.
+- Vertex AI deployment is more complex on Vercel because serverless environments need explicit credentials instead of local ADC.
+- The frontend currently focuses on a single research workflow rather than full conversational state/history.
 
-## Future Direction
+## Future Improvements
 
-A major next step is replacing part of the current retrieval dependency with a more controllable semantic scraping layer. The goal is to reduce search bottlenecks, improve frontier selection, and lower the latency introduced by repeated external search constraints.
+- Better observability around extraction-stage failures.
+- More explicit retry and fallback behavior for model calls.
+- Smarter frontier selection for local/business queries.
+- More test coverage around normalization and streaming edge cases.
+- Cleaner separation between local-dev helpers and deployment-specific behavior.
